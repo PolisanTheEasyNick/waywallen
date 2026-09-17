@@ -194,6 +194,12 @@ pub struct RendererDef {
     pub plugin_system: bool,
     pub bin: PathBuf,
     pub types: Vec<WallpaperType>,
+    /// Display labels for the entries of `types`, keyed by the type.
+    /// Presentation only — the key stays what the UI filters and the
+    /// daemon spawns on. Absent for manifests written before this
+    /// existed, and a type may be left out here without harm.
+    #[serde(default)]
+    pub type_labels: HashMap<WallpaperType, LocalizedTextDef>,
     #[serde(default = "default_priority")]
     pub priority: u32,
     /// Declares whether lack of frame progress is meaningful. Third-party
@@ -594,6 +600,22 @@ impl RendererRegistry {
         self.by_type.keys().collect()
     }
 
+    /// Display label for a wallpaper type, when a renderer names it.
+    ///
+    /// Several renderers may serve one type and disagree about the
+    /// label; `register` keeps each type's list sorted by descending
+    /// priority, so the renderer that would actually be spawned for the
+    /// type is the one that gets to name it.
+    /// The message is resolved against the catalog of the plugin that
+    /// owns that renderer.
+    pub fn type_label(&self, wp_type: &str) -> Option<crate::plugin::i18n::LocalizedText> {
+        self.by_type.get(wp_type)?.iter().find_map(|def| {
+            def.type_labels
+                .get(wp_type)
+                .map(|label| label.resolve(&def.plugin_id))
+        })
+    }
+
     /// List all registered renderer definitions (deduplicated by name).
     pub fn all_renderers(&self) -> Vec<&RendererDef> {
         let mut seen = std::collections::HashSet::new();
@@ -750,6 +772,25 @@ pub fn scan_plugins(dir: &Path, system: bool) -> PluginScan {
                 None
             });
             if let Some(error) = invalid_text {
+                log::error!("{error}");
+                continue;
+            }
+            let invalid_type_label = def.type_labels.iter().find_map(|(wp_type, label)| {
+                if !label.is_valid() {
+                    return Some(format!(
+                        "renderer {} type_labels.{wp_type} requires a non-empty msgid",
+                        def.name
+                    ));
+                }
+                if !def.types.contains(wp_type) {
+                    return Some(format!(
+                        "renderer {} type_labels.{wp_type} labels a type the renderer does not declare",
+                        def.name
+                    ));
+                }
+                None
+            });
+            if let Some(error) = invalid_type_label {
                 log::error!("{error}");
                 continue;
             }
@@ -1005,6 +1046,7 @@ types = ["image"]
             plugin_system: system,
             bin: PathBuf::from("/dev/null"),
             types: vec!["image".to_string()],
+            type_labels: Default::default(),
             priority: 100,
             activity: RendererActivityMode::OnDemand,
             spawn_version: None,
@@ -1327,6 +1369,99 @@ directory = "../i18n"
         "#;
         let m: PluginManifest = toml::from_str(src).expect("parses");
         assert!(m.renderers["waywallen-image"].legacy_events.is_none());
+    }
+
+    #[test]
+    fn manifest_parses_type_labels() {
+        let src = r#"
+            [plugin]
+            id = "org.waywallen.video"
+            name = "Video"
+
+            [renderers.waywallen-video]
+            bin = "bin/waywallen-video-renderer"
+            types = ["video"]
+            type_labels = { video = { msgid = "Video" } }
+        "#;
+        let m: PluginManifest = toml::from_str(src).expect("manifest parses");
+        let r = &m.renderers["waywallen-video"];
+        assert_eq!(r.type_labels["video"].msgid, "Video");
+    }
+
+    #[test]
+    fn manifest_without_type_labels_stays_empty() {
+        let src = r#"
+            [plugin]
+            id = "org.waywallen.image"
+            name = "Image"
+
+            [renderers.waywallen-image]
+            bin = "bin/waywallen-image-renderer"
+            types = ["image"]
+        "#;
+        let m: PluginManifest = toml::from_str(src).expect("manifest parses");
+        assert!(m.renderers["waywallen-image"].type_labels.is_empty());
+    }
+
+    #[test]
+    fn type_label_resolves_against_the_owning_plugin() {
+        let mut def = renderer("org.test.video", "1.0.0", false, "video");
+        def.types = vec!["video".to_string()];
+        def.type_labels.insert(
+            "video".to_string(),
+            LocalizedTextDef {
+                msgid: "Video".to_string(),
+            },
+        );
+        let mut registry = RendererRegistry::new();
+        registry.register(def);
+
+        let label = registry.type_label("video").expect("label");
+        let message = label.message().expect("plugin message");
+        assert_eq!(message.plugin_id, "org.test.video");
+        assert_eq!(message.msgid, "Video");
+    }
+
+    #[test]
+    fn type_label_absent_when_no_renderer_names_the_type() {
+        // A manifest written before type_labels existed: the caller gets
+        // nothing and shows the key, exactly as it did before.
+        let mut def = renderer("org.test.image", "1.0.0", false, "image");
+        def.types = vec!["image".to_string()];
+        let mut registry = RendererRegistry::new();
+        registry.register(def);
+
+        assert!(registry.type_label("image").is_none());
+        assert!(registry.type_label("nothing-serves-this").is_none());
+    }
+
+    #[test]
+    fn type_label_prefers_the_higher_priority_renderer() {
+        let mut low = renderer("org.test.low", "1.0.0", false, "low");
+        low.types = vec!["video".to_string()];
+        low.priority = 10;
+        low.type_labels.insert(
+            "video".to_string(),
+            LocalizedTextDef {
+                msgid: "Low".to_string(),
+            },
+        );
+        let mut high = renderer("org.test.high", "1.0.0", false, "high");
+        high.types = vec!["video".to_string()];
+        high.priority = 100;
+        high.type_labels.insert(
+            "video".to_string(),
+            LocalizedTextDef {
+                msgid: "High".to_string(),
+            },
+        );
+
+        let mut registry = RendererRegistry::new();
+        registry.register(low);
+        registry.register(high);
+
+        let label = registry.type_label("video").expect("label");
+        assert_eq!(label.message().expect("message").msgid, "High");
     }
 
     #[test]

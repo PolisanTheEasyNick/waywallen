@@ -13,6 +13,7 @@ directory = "i18n"
 [renderers.waywallen-image]
 bin = "../../../../bin/waywallen-image-renderer"
 types = ["image"]
+type_labels = { image = { msgid = "Image" } }
 priority = 100
 activity = "on_demand"
 spawn_version = 10

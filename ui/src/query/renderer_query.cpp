@@ -104,6 +104,7 @@ auto RendererPluginListQuery::renderers() const -> const QVariantList& { return 
 auto RendererPluginListQuery::supportedTypes() const -> const QStringList& {
     return m_supported_types;
 }
+auto RendererPluginListQuery::typeLabels() const -> const QVariantMap& { return m_type_labels; }
 
 void RendererPluginListQuery::reload() {
     setStatus(Status::Querying);
@@ -176,6 +177,14 @@ void RendererPluginListQuery::reload() {
             }
             self->m_supported_types = std::move(types);
             Q_EMIT self->supportedTypesChanged();
+
+            QVariantMap type_labels;
+            for (const auto& info : list_rsp.typeLabels()) {
+                if (info.type().isEmpty()) continue;
+                type_labels[info.type()] = pluginMessageFromPb(info.labelText(), info.label());
+            }
+            self->m_type_labels = std::move(type_labels);
+            Q_EMIT self->typeLabelsChanged();
         });
         co_return;
     });

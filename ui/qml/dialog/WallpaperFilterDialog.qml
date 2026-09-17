@@ -12,6 +12,8 @@ MD.Dialog {
     required property var popupWindow
     property var model
     property var supportedTypes: []
+    // Renderer-declared labels for the type keys, display only.
+    property var typeLabels: ({})
     // Quick type toggles (applied immediately, independent of the rule
     // editor's Apply/Reset). Chips show all types; a checked chip means
     // the type is shown. Unchecked types are what we record as skipped.
@@ -100,7 +102,7 @@ MD.Dialog {
                         delegate: MD.FilterChip {
                             required property var modelData
                             checkable: false
-                            text: qsTr(modelData)
+                            text: W.I18n.valueLabel(root.typeLabels, modelData)
                             checked: (root.skipTypes || []).indexOf(modelData) < 0
                             onClicked: root.toggleSkip(modelData)
                         }
@@ -208,6 +210,7 @@ MD.Dialog {
             width: ListView.view.width
             popupWindow: root.popupWindow
             supportedTypes: root.supportedTypes
+            typeLabels: root.typeLabels
             allTags: tagListQuery.tags
             valueLabels: root.valueLabels
             allContentRatings: ratingListQuery.ratings

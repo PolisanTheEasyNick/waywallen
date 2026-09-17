@@ -9,6 +9,10 @@ msgstr "包含图片文件的目录。同时扫描最多两级子目录。支持
 msgid "Frame rate"
 msgstr "帧率"
 
+#: plugin.toml
+msgid "Image"
+msgstr "图片"
+
 #: main.lua:14
 msgid "Image Folder"
 msgstr "图片文件夹"

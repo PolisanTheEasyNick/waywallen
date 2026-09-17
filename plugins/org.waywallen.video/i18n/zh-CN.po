@@ -53,6 +53,10 @@ msgstr "分辨率"
 msgid "Scheme color"
 msgstr "配色"
 
+#: plugin.toml
+msgid "Video"
+msgstr "视频"
+
 #: main.lua:14
 msgid "Video Folder"
 msgstr "视频文件夹"

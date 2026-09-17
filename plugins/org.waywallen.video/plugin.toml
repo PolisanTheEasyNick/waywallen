@@ -18,6 +18,7 @@ directory = "i18n"
 [renderers.waywallen-video]
 bin = "../../../../bin/waywallen-video-renderer"
 types = ["video"]
+type_labels = { video = { msgid = "Video" } }
 priority = 100
 activity = "continuous"
 spawn_version = 10

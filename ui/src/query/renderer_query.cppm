@@ -43,21 +43,28 @@ export class RendererPluginListQuery
 
     Q_PROPERTY(QVariantList renderers READ renderers NOTIFY renderersChanged FINAL)
     Q_PROPERTY(QStringList supportedTypes READ supportedTypes NOTIFY supportedTypesChanged FINAL)
+    /// Wallpaper type key -> display label, for the keys in
+    /// `supportedTypes` whose renderer declares one. A missing key means
+    /// the UI shows the key itself, as it always did.
+    Q_PROPERTY(QVariantMap typeLabels READ typeLabels NOTIFY typeLabelsChanged FINAL)
 
 public:
     RendererPluginListQuery(QObject* parent = nullptr);
 
     auto renderers() const -> const QVariantList&;
     auto supportedTypes() const -> const QStringList&;
+    auto typeLabels() const -> const QVariantMap&;
 
     void reload() override;
 
     Q_SIGNAL void renderersChanged();
     Q_SIGNAL void supportedTypesChanged();
+    Q_SIGNAL void typeLabelsChanged();
 
 private:
     QVariantList m_renderers;
     QStringList  m_supported_types;
+    QVariantMap  m_type_labels;
 };
 
 export class RendererKillQuery : public Query,

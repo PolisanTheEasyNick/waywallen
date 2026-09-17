@@ -9,6 +9,10 @@ msgstr "Каталог с файлами изображений. Также ск
 msgid "Frame rate"
 msgstr "Частота кадров"
 
+#: plugin.toml
+msgid "Image"
+msgstr "Изображение"
+
 #: main.lua:14
 msgid "Image Folder"
 msgstr "Папка с изображениями"

@@ -833,6 +833,7 @@ fn registry_with_video() -> RendererRegistry {
         plugin_system: false,
         bin: PathBuf::from("/dev/null"),
         types: vec!["video".into()],
+        type_labels: Default::default(),
         priority: 100,
         activity: crate::plugin::renderer_registry::RendererActivityMode::Continuous,
         spawn_version: Some(1),

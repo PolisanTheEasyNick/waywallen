@@ -422,6 +422,7 @@ MD.Page {
             popupWindow: root.Window.window
             model: wallpaperFilterModel
             supportedTypes: pluginQuery.supportedTypes || []
+            typeLabels: pluginQuery.typeLabels || ({})
             valueLabels: root.sourceValueLabels
             skipTypes: wallpaperQuery.skipTypes
             onToggleSkip: function (ty) {
@@ -1181,6 +1182,7 @@ MD.Page {
                 wallpaperId: root.requestedWallpaperId.length > 0 ? root.requestedWallpaperId : (root.selectedWallpaper?.id_proto ?? "")
                 fallbackWallpaper: root.selectedWallpaper
                 valueLabels: root.sourceValueLabels
+                typeLabels: pluginQuery.typeLabels || ({})
                 showApply: true
                 onBack: {
                     root.selectedWallpaper = null;
