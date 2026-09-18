@@ -12,6 +12,7 @@ MD.Page {
     property var wallpaper: null
     property real sizeBytes: 0
     property var valueLabels: ({})
+    property var typeLabels: ({})
 
     readonly property string tagsText: formatTagList(wallpaper?.tags)
     readonly property string metadataText: formatObject(wallpaper?.metadata)
@@ -127,7 +128,7 @@ MD.Page {
             InfoValue { text: root.value(root.wallpaper?.name) }
 
             InfoLabel { label: qsTr("Type") }
-            InfoValue { text: root.value(root.wallpaper?.wpType) }
+            InfoValue { text: W.I18n.valueLabel(root.typeLabels, root.wallpaper?.wpType) }
 
             InfoLabel { label: qsTr("Resource") }
             InfoValue { text: root.value(root.wallpaper?.resource) }

@@ -12,6 +12,8 @@ Item {
     property var fallbackWallpaper: null
     property bool showApply: true
     property var valueLabels: ({})
+    // Renderer-declared labels for wallpaper type keys, display only.
+    property var typeLabels: ({})
     property bool unsubscribeAccepted: false
     property var infoPresentation: null
 
@@ -93,7 +95,8 @@ Item {
             props: {
                 wallpaper: root.wp,
                 sizeBytes: root.infoSizeOf(root.wp),
-                valueLabels: root.valueLabels
+                valueLabels: root.valueLabels,
+                typeLabels: root.typeLabels
             }
         });
     }
@@ -438,7 +441,7 @@ Item {
 
                     MD.Text {
                         Layout.fillWidth: true
-                        text: root.wp?.wpType || ""
+                        text: W.I18n.valueLabel(root.typeLabels, root.wp?.wpType)
                         typescale: MD.Token.typescale.label_large
                         color: MD.Token.color.on_surface_variant
                         elide: Text.ElideRight

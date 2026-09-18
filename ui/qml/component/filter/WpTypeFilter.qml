@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 import QtQml
 import QtQuick
 import waywallen.control as WC
+import waywallen.ui as W
 import Qcm.Material as MD
 
 QtObject {
@@ -11,6 +12,8 @@ QtObject {
     property int condition: WC.StringCondition.STRING_CONDITION_UNSPECIFIED
     property WC.wallpaperStringFilter subfilter
     property var supportedTypes: []
+    // Type key -> label, as the renderer plugins named them.
+    property var typeLabels: ({})
     property bool _syncing: false
 
     readonly property var conditionModel: [
@@ -23,7 +26,7 @@ QtObject {
         const src = supportedTypes && supportedTypes.length > 0
                   ? supportedTypes
                   : ["image", "video", "scene"];
-        return src.map(t => ({ name: qsTr(t), value: t }));
+        return src.map(t => ({ name: W.I18n.valueLabel(root.typeLabels, t), value: t }));
     }
 
     function labelFor(v) {

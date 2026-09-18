@@ -53,6 +53,10 @@ msgstr "Разрешение"
 msgid "Scheme color"
 msgstr "Цветовая схема"
 
+#: plugin.toml
+msgid "Video"
+msgstr "Видео"
+
 #: main.lua:14
 msgid "Video Folder"
 msgstr "Папка с видео"

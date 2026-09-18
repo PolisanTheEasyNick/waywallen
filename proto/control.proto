@@ -433,6 +433,21 @@ message RendererPluginListRequest {}
 message RendererPluginListResponse {
   repeated RendererPluginInfo renderers = 1;
   repeated string supported_types = 2;
+  // Display labels for the keys in `supported_types`, looked up by
+  // `WallpaperTypeInfo.type`. Sparse: only types whose renderer manifest
+  // declares a label appear, and a client that finds no entry for a type
+  // shows the key itself, as it did before this field existed.
+  repeated WallpaperTypeInfo type_labels = 3;
+}
+
+// A wallpaper type key paired with the label a UI shows for it. The key
+// stays the filter/spawn value; only the presentation is localized.
+message WallpaperTypeInfo {
+  string type = 1;
+  // English source text as the plugin wrote it, so clients that do not
+  // resolve plugin messages still have something readable.
+  string label = 2;
+  PluginMessage label_text = 3;
 }
 message RendererPluginInfo {
   string name = 1;

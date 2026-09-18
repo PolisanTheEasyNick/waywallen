@@ -53,6 +53,7 @@ using proto::RendererPluginInfo;
 using proto::RendererPluginListRequest;
 using proto::RendererPluginListResponse;
 using proto::SettingSchema;
+using proto::WallpaperTypeInfo;
 
 using proto::PresentationTarget;
 using proto::WallpaperApplyRequest;

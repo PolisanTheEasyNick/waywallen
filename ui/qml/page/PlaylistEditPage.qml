@@ -118,6 +118,11 @@ MD.Page {
 
     actions: [resetAction, applyAction]
 
+    // Renderer-declared labels for the wallpaper type keys shown per row.
+    W.RendererPluginListQuery {
+        id: pluginQuery
+    }
+
     W.PlaylistDetailQuery {
         id: detailQuery
 
@@ -376,7 +381,7 @@ MD.Page {
                     height: implicitHeight
                     radius: 10
                     text: model.name || qsTr("Untitled")
-                    supportText: String(root.draftEntryIds.indexOf(wallpaperDelegate.entryId) + 1) + " · " + String(model.wpType || "")
+                    supportText: String(root.draftEntryIds.indexOf(wallpaperDelegate.entryId) + 1) + " · " + W.I18n.valueLabel(pluginQuery.typeLabels, model.wpType)
                     heightMode: MD.Enum.ListItemTwoLine
                     wrapMode: Text.Wrap
                     elide: Text.ElideRight

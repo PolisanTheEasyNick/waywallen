@@ -11,6 +11,7 @@ MD.ItemDelegate {
     required property int index
     required property var popupWindow
     property var supportedTypes: []
+    property var typeLabels: ({})
     property var allTags: []
     property var valueLabels: ({})
     property var allContentRatings: []
@@ -73,6 +74,7 @@ MD.ItemDelegate {
         id: wpTypeSpec
         filter: root.currentOption && root.currentOption.kind === "wp_type" ? root.model : null
         supportedTypes: root.supportedTypes
+        typeLabels: root.typeLabels
     }
     W.IntFilter {
         id: intSpec

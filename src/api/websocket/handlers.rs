@@ -280,9 +280,24 @@ pub(super) async fn dispatch_inner(
             let mut supported_types: Vec<_> =
                 registry.supported_types().into_iter().cloned().collect();
             supported_types.sort();
+            // Presentation only: every type keeps its key in
+            // `supported_types`, and a type whose renderer names no label
+            // simply has no entry here.
+            let type_labels = supported_types
+                .iter()
+                .filter_map(|wp_type| {
+                    let label = registry.type_label(wp_type)?;
+                    Some(pb::WallpaperTypeInfo {
+                        r#type: wp_type.clone(),
+                        label: label.text().to_string(),
+                        label_text: crate::control_proto::plugin_message_to_proto(&label),
+                    })
+                })
+                .collect();
             Res::RendererPluginList(pb::RendererPluginListResponse {
                 renderers,
                 supported_types,
+                type_labels,
             })
         }
 

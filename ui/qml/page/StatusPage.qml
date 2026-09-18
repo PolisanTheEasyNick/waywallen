@@ -463,7 +463,7 @@ MD.Page {
                     SectionHint {
                         typescale: MD.Token.typescale.label_medium
                         visible: pluginQuery.supportedTypes && pluginQuery.supportedTypes.length > 0
-                        text: qsTr("Supported types: %1").arg(pluginQuery.supportedTypes ? pluginQuery.supportedTypes.join(", ") : "")
+                        text: qsTr("Supported types: %1").arg((pluginQuery.supportedTypes ?? []).map(t => W.I18n.valueLabel(pluginQuery.typeLabels, t)).join(", "))
                     }
 
                     SectionHint {
