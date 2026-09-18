@@ -4,7 +4,7 @@
 
 | Dependency | Version | Notes |
 |------------|---------|-------|
-| [Lito](https://github.com/litocpp/lito) | latest | Project build entry |
+| [Lito](https://github.com/litocpp/lito) | ≥ 0.8.1 | Project build entry; 0.8.0 fails to resolve this workspace, and 0.8.1 is the release that stages the generated QML modules |
 | Rust | stable | |
 | Clang | 22+ | [LLVM-22.1.8-Linux-X64](https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz) |
 | CMake | 3.28+ | Host tool used by Lito source dependency providers |
@@ -46,9 +46,48 @@ lito build -p waywallen-ui --profile debug
 lito test -p waywallen-bridge --profile debug
 ```
 
+`--profile` takes the Lito built-in profiles: `debug`, `release`, `relwithdebinfo` and `plain`.
+
+`-p` takes a workspace package name:
+
+| Package | Path |
+|---------|------|
+| `waywallen-ui` | `ui` |
+| `waywallen-bridge` | `bridge` |
+| `waywallen-plugin-common` | `plugins` |
+| `waywallen-image-plugin` | `plugins/org.waywallen.image` |
+| `waywallen-video-plugin` | `plugins/org.waywallen.video` |
+| `waywallen-wallhaven-plugin` | `plugins/org.waywallen.wallhaven` |
+| `waywallen-i18n` | `tools/i18n` |
+| `waywallen-plugin-i18n` | `tools/i18n/po` |
+
+A bare `lito build` builds the workspace default members: `ui`, the three plugin packages and
+`tools/i18n`. `waywallen-bridge` is not one of them; it is built as a dependency of the plugin
+packages.
+
+The `waywallen` daemon is not a Lito package at all. It is the Rust crate at the repository root,
+declared as a Cargo external dependency of `waywallen-ui`, so Lito drives Cargo for it.
+
 `waywallen-layer-shell` lives in the `waywallen-display` Cargo package. It is not built or
 installed by the normal Lito flow; packaging that bundles the display backend builds it from the
 `waywallen-display` repository.
+
+## Checking the QML
+
+Since lito 0.8.1 the generated `waywallen.ui` module is staged under its URI path, so
+`build/<profile>/generated/waywallen-ui/lito-qml` is a QML import path and `qmllint` and `qmlls`
+can resolve the module when checking `ui/qml`:
+
+```bash
+lito build -p waywallen-ui --profile debug
+qmllint -I build/debug/generated/waywallen-ui/lito-qml \
+        -I build/debug/dependencies/cmake/qml_material-*/query/build/qml_modules \
+        ui/qml/page/StatusPage.qml
+```
+
+This requires lito >= 0.8.1; earlier versions stage the module as `lito-qml/waywallen_ui`, which
+does not match the `waywallen.ui` import. `qmllint` and `qmlls` must be the Qt 6 ones; where Qt 5
+comes first in `PATH`, use `/usr/lib/qt6/bin/qmllint`.
 
 ## Launching
 
