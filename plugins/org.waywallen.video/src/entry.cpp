@@ -341,6 +341,7 @@ const char* hwdec_label(wavsen::video::HwAccel h) {
     case wavsen::video::HwAccel::Vulkan: return "vulkan";
     case wavsen::video::HwAccel::Vaapi: return "vaapi";
     case wavsen::video::HwAccel::None: return "none";
+    case wavsen::video::HwAccel::VideoToolbox: return "videotoolbox";
     }
     return "?";
 }
@@ -348,6 +349,7 @@ const char* hwdec_label(wavsen::video::HwAccel h) {
 const char* kind_label(wavsen::video::FrameKind k) {
     switch (k) {
     case wavsen::video::FrameKind::Sw: return "sw";
+    case wavsen::video::FrameKind::VideoToolbox: return "videotoolbox";
     case wavsen::video::FrameKind::VulkanShared: return "vulkan-shared";
     case wavsen::video::FrameKind::VaapiDrm: return "vaapi-drm";
     }
@@ -357,6 +359,7 @@ const char* kind_label(wavsen::video::FrameKind k) {
 const char* runtime_hwdec_label(wavsen::video::FrameKind kind) {
     switch (kind) {
     case wavsen::video::FrameKind::Sw: return "sw";
+    case wavsen::video::FrameKind::VideoToolbox: return "videotoolbox";
     case wavsen::video::FrameKind::VulkanShared: return "vulkan";
     case wavsen::video::FrameKind::VaapiDrm: return "vaapi";
     }
@@ -832,15 +835,17 @@ int run_selftest(const Options& opt) {
         ici.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(producer->device(), &ici, nullptr, &dst_images[target_index]) !=
-            VK_SUCCESS) {
+        if (producer->device_dispatch().vkCreateImage(
+                producer->device(), &ici, nullptr, &dst_images[target_index]) != VK_SUCCESS) {
             rstd_error("selftest vkCreateImage failed");
             return 1;
         }
         VkMemoryRequirements mr {};
-        vkGetImageMemoryRequirements(producer->device(), dst_images[target_index], &mr);
+        producer->device_dispatch().vkGetImageMemoryRequirements(
+            producer->device(), dst_images[target_index], &mr);
         VkPhysicalDeviceMemoryProperties mp {};
-        vkGetPhysicalDeviceMemoryProperties(producer->physical_device(), &mp);
+        producer->instance_dispatch().vkGetPhysicalDeviceMemoryProperties(
+            producer->physical_device(), &mp);
         uint32_t type = std::numeric_limits<uint32_t>::max();
         for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
             if ((mr.memoryTypeBits & (1u << i)) &&
@@ -857,9 +862,9 @@ int run_selftest(const Options& opt) {
         mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.allocationSize  = mr.size;
         mai.memoryTypeIndex = type;
-        if (vkAllocateMemory(producer->device(), &mai, nullptr, &dst_memories[target_index]) !=
-                VK_SUCCESS ||
-            vkBindImageMemory(
+        if (producer->device_dispatch().vkAllocateMemory(
+                producer->device(), &mai, nullptr, &dst_memories[target_index]) != VK_SUCCESS ||
+            producer->device_dispatch().vkBindImageMemory(
                 producer->device(), dst_images[target_index], dst_memories[target_index], 0) !=
                 VK_SUCCESS) {
             rstd_error("selftest vkAllocateMemory/Bind failed");
@@ -991,17 +996,19 @@ int run_selftest(const Options& opt) {
         ::close(sync_fd);
     }
     if (kind == wavsen::video::FrameKind::Sw) {
-        (void)vkDeviceWaitIdle(producer->device());
+        (void)producer->device_dispatch().vkDeviceWaitIdle(producer->device());
     } else if (auto drained = yuv->drain_submissions(rstd::u64(1'000'000'000)); drained.is_err()) {
         rstd_error("selftest conversion drain: {}",
                    rstd::move(drained).unwrap_err().message.as_str());
-        (void)vkDeviceWaitIdle(producer->device());
+        (void)producer->device_dispatch().vkDeviceWaitIdle(producer->device());
     }
     (void)yuv->reclaim_submissions();
     (void)yuv->invalidate_targets();
     for (uint32_t target_index = 0; target_index < target_count; ++target_index) {
-        vkDestroyImage(producer->device(), dst_images[target_index], nullptr);
-        vkFreeMemory(producer->device(), dst_memories[target_index], nullptr);
+        producer->device_dispatch().vkDestroyImage(
+            producer->device(), dst_images[target_index], nullptr);
+        producer->device_dispatch().vkFreeMemory(
+            producer->device(), dst_memories[target_index], nullptr);
     }
 
     if (sync_fd < 0) return 1;
@@ -1207,7 +1214,7 @@ int run(int argc, char** argv) {
                              volume_pct);
 
     ww_bridge_vk_dt_t vdt {};
-    ww_bridge_vk_dt_load(&vdt, vkGetInstanceProcAddr, producer->instance());
+    ww_bridge_vk_dt_load(&vdt, producer->instance_dispatch().resolver, producer->instance());
     ww_bridge_vk_log_gpu_info("waywallen-video-renderer", &vdt, producer->physical_device());
 
     auto yuv_res = wavsen::video::YuvToRgba::create(producer->instance_dispatch(),
@@ -1254,12 +1261,12 @@ int run(int argc, char** argv) {
     pool_init.queue              = producer->queue();
     pool_init.queue_family_index = producer->queue_family_index().to_primitive();
     pool_init.get_instance_proc_addr =
-        reinterpret_cast<void* (*)(void*, const char*)>(vkGetInstanceProcAddr);
+        reinterpret_cast<void* (*)(void*, const char*)>(producer->instance_dispatch().resolver);
     pool_init.device_uuid = producer->device_uuid();
     pool_init.driver_uuid = producer->driver_uuid();
     {
         ww_bridge_vk_dt_t dt {};
-        ww_bridge_vk_dt_load(&dt, vkGetInstanceProcAddr, producer->instance());
+        ww_bridge_vk_dt_load(&dt, producer->instance_dispatch().resolver, producer->instance());
         if (int rc = ww_bridge_vk_query_render_node(&dt,
                                                     producer->physical_device(),
                                                     &pool_init.drm_render_major,
@@ -1514,13 +1521,20 @@ int run(int argc, char** argv) {
             continue;
         }
 
-        rstd::f64                                                    frame_pts { -1.0 };
-        const auto                                                   fkind = decoder->get()->kind();
+        rstd::f64  frame_pts { -1.0 };
+        const auto fkind = decoder->get()->kind();
+        if (fkind == wavsen::video::FrameKind::VideoToolbox) {
+            rstd_error("waywallen-video-renderer: VideoToolbox frames are unsupported by the "
+                       "Vulkan bridge");
+            signal_shutdown(host);
+            break;
+        }
         rstd::Option<wavsen::video::VkFrameLease>                    vulkan_frame;
         rstd::Option<wavsen::video::VaapiFrameLease>                 vaapi_frame;
         rstd::Result<wavsen::video::NextFrame, wavsen::video::Error> fs_res =
             rstd::Ok(wavsen::video::NextFrame::Ok);
         switch (fkind) {
+        case wavsen::video::FrameKind::VideoToolbox: break;
         case wavsen::video::FrameKind::VulkanShared: {
             auto pulled = decoder->get()->next_vk_frame();
             if (pulled.is_err()) {
@@ -1573,6 +1587,7 @@ int run(int argc, char** argv) {
         }
         const bool decoder_looped = fs == wavsen::video::NextFrame::Looped;
         switch (fkind) {
+        case wavsen::video::FrameKind::VideoToolbox: break;
         case wavsen::video::FrameKind::VulkanShared:
             if (vulkan_frame.is_none()) {
                 rstd_error("waywallen-video-renderer: Vulkan decode returned no frame lease");
@@ -1666,6 +1681,7 @@ int run(int argc, char** argv) {
         rstd::u32 cs_id;
         rstd::u32 cr_id;
         switch (fkind) {
+        case wavsen::video::FrameKind::VideoToolbox: break;
         case wavsen::video::FrameKind::VulkanShared:
             cs_id = vulkan_frame->info().colorspace;
             cr_id = vulkan_frame->info().color_range;
@@ -1684,6 +1700,7 @@ int run(int argc, char** argv) {
             static_cast<wavsen::video::ColorRange>(cr_id.to_primitive()));
         rstd::Result<int, wavsen::video::Error> cv_res = rstd::Ok(-1);
         switch (fkind) {
+        case wavsen::video::FrameKind::VideoToolbox: break;
         case wavsen::video::FrameKind::VulkanShared: {
             auto converted = yuv->submit_av_vk_frame(
                 rstd::move(*conversion_reservation), rstd::move(*vulkan_frame), color_matrix);
@@ -1757,7 +1774,7 @@ int run(int argc, char** argv) {
     if (auto drained = yuv->drain_submissions(rstd::u64(1'000'000'000)); drained.is_err()) {
         rstd_warn("waywallen-video-renderer: final conversion drain failed: {}",
                   rstd::move(drained).unwrap_err().message.as_str());
-        (void)vkDeviceWaitIdle(producer->device());
+        (void)producer->device_dispatch().vkDeviceWaitIdle(producer->device());
         (void)yuv->reclaim_submissions();
     }
     if (auto invalidated = yuv->invalidate_targets(); invalidated.is_err()) {
