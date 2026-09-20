@@ -65,8 +65,8 @@ pub enum DisplayOutEvent {
         pool: Arc<PublishedPool>,
         buffer_generation: u64,
         initial_config: CompositionConfig,
-        /// Animate from the presented content to this pool.
-        transition: bool,
+        content_token: ContentToken,
+        presentation_config_generation: u64,
     },
     /// Retire the named buffer pool generation.
     Unbind { buffer_generation: u64 },
@@ -86,6 +86,26 @@ pub enum DisplayOutEvent {
         consumption: DisplayConsumptionPermit,
         member: Option<crate::wallframe::sync::FrameConsumerMember>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentToken(u64);
+
+impl ContentToken {
+    pub(crate) fn new(value: u64) -> Self {
+        assert_ne!(value, 0, "display content token must be non-zero");
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ContentIdentity {
+    Wallpaper(String),
+    Renderer(RendererId),
 }
 
 pub const PRESENTATION_CAP_PAUSE_BLUR: u32 = 1 << 0;
@@ -458,6 +478,7 @@ struct DisplayBinding {
     renderer: Arc<RendererHandle>,
     pool: Arc<PublishedPool>,
     wire_generation: u64,
+    content_token: ContentToken,
 }
 
 struct DisplayState {
@@ -473,10 +494,6 @@ struct DisplayState {
     failed_binding_generation: Option<u64>,
     presentation_caps: u32,
     presentation: PresentationSnapshot,
-    /// Renderer id and spec revision of the content last bound to this
-    /// display. Survives unbind so a later bind can tell whether it
-    /// replaces the wallpaper still on screen.
-    presented_content: Option<(RendererId, u64)>,
     accepted: bool,
     /// Per-display auto replay machine driven by display facts and
     /// the resolved rule policy.
@@ -621,6 +638,29 @@ struct Inner {
     next_display_id: u64,
     next_display_session_id: crate::wallframe::sync::DisplaySessionId,
     next_config_generation: u64,
+    content_tokens: HashMap<ContentIdentity, ContentToken>,
+    next_content_token: u64,
+}
+
+impl Inner {
+    fn content_token_for_renderer(&mut self, renderer_id: &str) -> ContentToken {
+        let identity = self
+            .renderer_slots
+            .get(renderer_id)
+            .and_then(|slot| slot.wallpaper_id.clone())
+            .map(ContentIdentity::Wallpaper)
+            .unwrap_or_else(|| ContentIdentity::Renderer(renderer_id.to_owned()));
+        if let Some(token) = self.content_tokens.get(&identity) {
+            return *token;
+        }
+        self.next_content_token = self
+            .next_content_token
+            .checked_add(1)
+            .expect("display content token exhausted");
+        let token = ContentToken::new(self.next_content_token);
+        self.content_tokens.insert(identity, token);
+        token
+    }
 }
 
 pub struct Router {
@@ -698,6 +738,8 @@ impl Router {
                 next_display_id: 0,
                 next_display_session_id: 0,
                 next_config_generation: 0,
+                content_tokens: HashMap::new(),
+                next_content_token: 0,
                 session_locked: false,
                 session_inactive: false,
                 manual_paused: false,
@@ -1761,7 +1803,6 @@ impl Router {
                     failed_binding_generation: None,
                     presentation_caps: reg.presentation_caps,
                     presentation,
-                    presented_content: None,
                     accepted: false,
                     auto_replay: auto_replay::State::new(),
                     consumption_epoch: Arc::new(AtomicU64::new(1)),
@@ -5515,7 +5556,7 @@ mod tests {
         pool.modifier = nl;
         renderer.test_publish_pool(pool);
         mgr.register_test_handle(renderer.clone()).await;
-        router.register_renderer(renderer).await;
+        router.register_renderer(renderer.clone()).await;
 
         let mut registration = reg("D1", 1920, 1080);
         registration.consumer_caps = build_caps(
@@ -5523,7 +5564,9 @@ mod tests {
             &[(N::DRM_FORMAT_MOD_LINEAR, 1), (nl, 1)],
             0xAA,
         );
-        let h = router.register_display(registration).await;
+        let mut h = router.register_display(registration).await;
+        let initial_tokens = bind_content_tokens(&mut h.rx);
+        assert_eq!(initial_tokens.len(), 1);
         let generation = router.inner.lock().await.displays[&h.id]
             .binding
             .as_ref()
@@ -5576,11 +5619,20 @@ mod tests {
             }
         );
 
-        let inner = router.inner.lock().await;
-        let state = inner.displays.get(&h.id).unwrap();
-        let bl = &state.consumer_caps.blacklist;
-        assert!(bl.contains(&(N::DRM_FORMAT_ABGR8888, nl)));
-        assert_eq!(state.failed_binding_generation, Some(generation));
+        {
+            let inner = router.inner.lock().await;
+            let state = inner.displays.get(&h.id).unwrap();
+            let bl = &state.consumer_caps.blacklist;
+            assert!(bl.contains(&(N::DRM_FORMAT_ABGR8888, nl)));
+            assert_eq!(state.failed_binding_generation, Some(generation));
+        }
+
+        let mut fallback_pool = fake_published_pool(2, 1920, 1080);
+        fallback_pool.fourcc = N::DRM_FORMAT_ABGR8888;
+        fallback_pool.modifier = N::DRM_FORMAT_MOD_LINEAR;
+        renderer.test_publish_pool(fallback_pool);
+        router.on_renderer_bind("R1").await;
+        assert_eq!(bind_content_tokens(&mut h.rx), initial_tokens);
     }
 
     #[tokio::test]
@@ -5998,10 +6050,8 @@ mod tests {
                 }
                 DisplayOutEvent::Bind {
                     renderer,
-                    pool: _,
                     buffer_generation,
-                    initial_config: _,
-                    transition: _,
+                    ..
                 } => {
                     assert_eq!(renderer.id, "r1");
                     assert!(buffer_generation > 1);
@@ -6271,13 +6321,26 @@ mod tests {
         store
     }
 
-    fn bind_transitions(rx: &mut mpsc::UnboundedReceiver<DisplayOutEvent>) -> Vec<bool> {
+    fn bind_content_metadata(
+        rx: &mut mpsc::UnboundedReceiver<DisplayOutEvent>,
+    ) -> Vec<(ContentToken, u64)> {
         drain_display_events(rx)
             .into_iter()
             .filter_map(|event| match event {
-                DisplayOutEvent::Bind { transition, .. } => Some(transition),
+                DisplayOutEvent::Bind {
+                    content_token,
+                    presentation_config_generation,
+                    ..
+                } => Some((content_token, presentation_config_generation)),
                 _ => None,
             })
+            .collect()
+    }
+
+    fn bind_content_tokens(rx: &mut mpsc::UnboundedReceiver<DisplayOutEvent>) -> Vec<ContentToken> {
+        bind_content_metadata(rx)
+            .into_iter()
+            .map(|(token, _)| token)
             .collect()
     }
 
@@ -6306,7 +6369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_requests_transition_only_when_content_changes() {
+    async fn bind_content_tokens_follow_logical_content() {
         let store = settings_with_transition(TransitionKind::Fade).await;
         let mgr = Arc::new(RendererManager::new_default());
         let router = Router::new(mgr.clone());
@@ -6328,11 +6391,13 @@ mod tests {
             display.presentation.config.transition.kind,
             TransitionKind::Fade
         );
+        let initial = bind_content_metadata(&mut display.rx);
+        assert_eq!(initial.len(), 1);
         assert_eq!(
-            bind_transitions(&mut display.rx),
-            vec![false],
-            "the first content on a display has nothing to animate from"
+            initial[0].1, display.presentation.config.generation,
+            "Bind must reference the config snapshot published at registration"
         );
+        let r1_token = initial[0].0;
         // Registration links every display to r1. Anchor r2 on its own
         // display so relinking the display under test never orphans it.
         let _anchor_r1 = router.register_display(reg("DP-1", 1920, 1080)).await;
@@ -6342,18 +6407,46 @@ mod tests {
 
         r1.test_publish_pool(fake_published_pool(2, 3840, 2160));
         router.on_renderer_bind("r1").await;
-        assert_eq!(bind_transitions(&mut display.rx), vec![false]);
+        assert_eq!(bind_content_tokens(&mut display.rx), vec![r1_token]);
 
         router.relink_displays_to(&[display.id], "r2").await;
-        assert_eq!(bind_transitions(&mut display.rx), vec![true]);
+        let r2_tokens = bind_content_tokens(&mut display.rx);
+        assert_eq!(r2_tokens.len(), 1);
+        assert_ne!(r2_tokens[0], r1_token);
 
         router.relink_displays_to(&[display.id], "r1").await;
-        assert_eq!(bind_transitions(&mut display.rx), vec![true]);
+        assert_eq!(bind_content_tokens(&mut display.rx), vec![r1_token]);
 
         store.update(|s| s.global.transition.kind = TransitionKind::None);
         router.resync_presentation_configs().await;
         router.relink_displays_to(&[display.id], "r2").await;
-        assert_eq!(bind_transitions(&mut display.rx), vec![false]);
+        assert_eq!(bind_content_tokens(&mut display.rx), r2_tokens);
+    }
+
+    #[tokio::test]
+    async fn content_tokens_are_interned_by_wallpaper_identity() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let r1 = RendererHandle::test_stub("r1", "image");
+        let r2 = RendererHandle::test_stub("r2", "image");
+        mgr.register_test_handle(r1.clone()).await;
+        mgr.register_test_handle(r2.clone()).await;
+        router.register_renderer(r1).await;
+        router.register_renderer(r2).await;
+
+        let mut inner = router.inner.lock().await;
+        inner.renderer_slots.get_mut("r1").unwrap().wallpaper_id = Some("wallpaper-a".into());
+        inner.renderer_slots.get_mut("r2").unwrap().wallpaper_id = Some("wallpaper-a".into());
+        let a1 = inner.content_token_for_renderer("r1");
+        let a2 = inner.content_token_for_renderer("r2");
+        assert_eq!(a1, a2);
+
+        inner.renderer_slots.get_mut("r2").unwrap().wallpaper_id = Some("wallpaper-b".into());
+        let b = inner.content_token_for_renderer("r2");
+        assert_ne!(a1, b);
+
+        inner.renderer_slots.get_mut("r2").unwrap().wallpaper_id = Some("wallpaper-a".into());
+        assert_eq!(inner.content_token_for_renderer("r2"), a1);
     }
 
     #[tokio::test]
