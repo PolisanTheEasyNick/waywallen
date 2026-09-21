@@ -435,8 +435,8 @@
         <translation>Приостановлено</translation>
     </message>
     <message>
-        <source>Paused by playback policy</source>
-        <translation>Приостановлено политикой воспроизведения</translation>
+        <source>Automatically paused</source>
+        <translation>Приостановлено автоматически</translation>
     </message>
     <message>
         <location filename="../qml/page/DisplaysPage.qml" line="13"/>
@@ -1659,6 +1659,9 @@ Related display: #%1</source>
 </context>
 <context>
     <name>SettingsPage</name>
+    <message><source>Current display</source><translation>Текущий дисплей</translation></message>
+    <message><source>All displays</source><translation>Все дисплеи</translation></message>
+    <message><source>Applies to</source><translation>Область действия</translation></message>
     <message>
         <location filename="../qml/page/SettingsPage.qml" line="15"/>
         <source>Settings</source>

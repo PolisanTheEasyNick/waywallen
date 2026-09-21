@@ -22,7 +22,7 @@ const RUNTIME_HEALTH_POLL: Duration = Duration::from_millis(500);
 use crate::catalog::properties::WallpaperLayoutOverride;
 use crate::plugin::renderer_registry::RendererActivityMode;
 use crate::settings::{
-    AutoAction, AutoReplayPolicy, PauseEffectConfig as StoredPauseEffectConfig, PauseEffectKind,
+    AutoReplayPolicy, PauseEffectConfig as StoredPauseEffectConfig, PauseEffectKind,
     ResolvedLayout, SettingsStore, TransitionConfig, TransitionKind,
 };
 use crate::wallframe::display::layout::{FillMode, LayoutInput};
@@ -39,6 +39,7 @@ use crate::wallframe::scheduler::{CompositionConfig, DisplayId, DisplayInfo, Dis
 use super::auto_replay;
 use super::table::{Link, LinkDstRect, LinkId, LinkProjection, LinkSrcRect, RoutingTable};
 
+mod auto_policy;
 mod composition;
 mod consumption;
 mod deadline;
@@ -178,21 +179,6 @@ impl DisplayConsumptionPermit {
     pub fn is_current(&self) -> bool {
         self.current.load(Ordering::Acquire) == self.epoch
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutoStateAction {
-    Reconcile,
-    ScheduleResume {
-        display_id: DisplayId,
-        token: u64,
-        delay: Duration,
-    },
-    CancelResume {
-        display_id: DisplayId,
-        reconcile: bool,
-    },
-    Noop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +489,7 @@ struct DisplayState {
     auto_replay: auto_replay::State,
     consumption_epoch: Arc<AtomicU64>,
     manual_paused: bool,
+    auto_paused: bool,
     resume_frame_requested: bool,
     published_pause: Option<(bool, bool)>,
 }
@@ -616,6 +603,9 @@ struct Inner {
     resume_retry_tasks: HashMap<RendererId, JoinHandle<()>>,
     next_start_token: u64,
     next_resume_retry_generation: u64,
+    session_auto_replay: auto_replay::State,
+    auto_effects: auto_replay::Effects,
+    auto_stopped_renderers: HashSet<RendererId>,
     /// Set when the screen-saver / lock-screen is active.
     session_locked: bool,
     /// Set when the current login session is inactive.
@@ -649,6 +639,19 @@ struct Inner {
 }
 
 impl Inner {
+    fn auto_stops_renderer(&self, renderer_id: &str) -> bool {
+        self.auto_effects.stop
+            || self
+                .table
+                .links_for_renderer(renderer_id)
+                .iter()
+                .any(|link| {
+                    self.displays
+                        .get(&link.display_id)
+                        .is_some_and(|display| display.auto_replay.effects().stop_local)
+                })
+    }
+
     fn content_token_for_renderer(&mut self, renderer_id: &str) -> ContentToken {
         let identity = self
             .renderer_slots
@@ -746,6 +749,9 @@ impl Router {
                 next_config_generation: 0,
                 content_tokens: HashMap::new(),
                 next_content_token: 0,
+                session_auto_replay: auto_replay::State::new(),
+                auto_effects: auto_replay::Effects::default(),
+                auto_stopped_renderers: HashSet::new(),
                 session_locked: false,
                 session_inactive: false,
                 manual_paused: false,
@@ -1424,7 +1430,16 @@ impl Router {
             inner.table.add_renderer(handle);
             inner.renderer_tasks.insert(id.clone(), task);
         }
-        self.reconcile_registered_lifecycle(&id).await;
+        let stopped = {
+            let inner = self.inner.lock().await;
+            inner.manual_stopped || inner.auto_stops_renderer(&id)
+        };
+        if stopped {
+            self.begin_retained_stop(&id).await;
+            Box::pin(self.finish_retained_stop(&id)).await;
+        } else {
+            self.reconcile_registered_lifecycle(&id).await;
+        }
         self.refresh_runtime_health().await;
         true
     }
@@ -1814,6 +1829,7 @@ impl Router {
                     auto_replay: auto_replay::State::new(),
                     consumption_epoch: Arc::new(AtomicU64::new(1)),
                     manual_paused: false,
+                    auto_paused: false,
                     resume_frame_requested: false,
                     published_pause: None,
                 },
@@ -1852,7 +1868,7 @@ impl Router {
                         .unwrap_or_else(|| {
                             wallpaper_layout.apply_to(self.resolved_layout_default())
                         });
-                    let enabled = !inner.manual_stopped;
+                    let enabled = !inner.manual_stopped && !inner.auto_effects.stop;
                     inner.table.add_link_with_projection(
                         renderer_id,
                         id,
@@ -1873,7 +1889,7 @@ impl Router {
                     ids.into_iter().next()
                 });
                 if let Some(renderer_id) = auto.clone() {
-                    let enabled = !inner.manual_stopped;
+                    let enabled = !inner.manual_stopped && !inner.auto_effects.stop;
                     inner.table.add_link_with_enabled(renderer_id, id, enabled);
                 }
                 auto
@@ -1888,10 +1904,8 @@ impl Router {
         if let Some(rid) = auto_linked.as_deref() {
             self.cancel_orphan_timer(rid).await;
         }
-        let auto_action = self
-            .update_auto_state(display_id, Some(initial_window_state_flags))
+        self.update_display_window_state(display_id, initial_window_state_flags)
             .await;
-        self.run_auto_state_action(auto_action).await;
         if let Some(renderer_id) = auto_linked.as_deref() {
             if let Err(error) = self
                 .request_renderer_start(renderer_id, RendererStartCause::DisplayReconnect)
@@ -1991,6 +2005,7 @@ impl Router {
         // Any renderer that just lost its last link enters the 5s
         // grace window; no new renderer is protected during unplug.
         self.mark_orphans(None).await;
+        self.refresh_auto_policy(false).await;
         self.reconcile_lifecycle().await;
         self.reconcile_buffer_flags().await;
         self.refresh_runtime_health().await;
@@ -2178,8 +2193,14 @@ impl Router {
     /// Update the per-display auto replay machine from a consumer's
     /// `set_window_state` request.
     pub async fn update_display_window_state(self: &Arc<Self>, display_id: DisplayId, flags: u32) {
-        let action = self.update_auto_state(display_id, Some(flags)).await;
-        self.run_auto_state_action(action).await;
+        {
+            let mut inner = self.inner.lock().await;
+            let Some(state) = inner.displays.get_mut(&display_id) else {
+                return;
+            };
+            state.auto_replay.last_flags = flags;
+        }
+        self.refresh_auto_policy(false).await;
     }
 
     async fn reconcile_presentation_config(self: &Arc<Self>, display_id: DisplayId) {
@@ -2278,11 +2299,7 @@ impl Router {
     }
 
     pub async fn resync_auto_replay(self: &Arc<Self>) {
-        let display_ids: Vec<DisplayId> = {
-            let inner = self.inner.lock().await;
-            inner.displays.keys().copied().collect()
-        };
-        self.refresh_auto_states(display_ids).await;
+        self.refresh_auto_policy(true).await;
     }
 
     /// Subscribe to router events (display add/change/remove). The
@@ -3368,6 +3385,17 @@ impl Router {
     /// Compute the current Pause/Play diff and dispatch control
     /// messages outside the inner lock after lifecycle mutations.
     async fn reconcile_lifecycle(self: &Arc<Self>) {
+        let reconcile_stop = {
+            let inner = self.inner.lock().await;
+            inner.auto_effects.stop
+                || !inner.auto_stopped_renderers.is_empty()
+                || inner.displays.values().any(|display| {
+                    display.auto_replay.stop_applied || display.auto_replay.effects().stop_local
+                })
+        };
+        if reconcile_stop {
+            Box::pin(self.apply_auto_stop_links()).await;
+        }
         self.reconcile_lifecycle_inner(None).await;
     }
 
@@ -3390,10 +3418,6 @@ impl Router {
                     .collect();
                 let has_active_link = !links.is_empty();
                 let has_frame_demand = links.iter().any(|link| inner.has_frame_demand(link));
-                let auto_mute_decision = links.iter().find_map(|link| {
-                    let decision = inner.displays.get(&link.display_id)?.auto_replay.requested;
-                    (decision.action == AutoAction::Mute).then_some(decision)
-                });
                 let manual_paused =
                     inner.manual_paused || inner.renderer_manual_paused.contains(&rid);
                 let manual_muted = inner.manual_muted;
@@ -3402,7 +3426,7 @@ impl Router {
                 let should_mute = manual_muted
                     || other_playback_active
                     || !has_active_link
-                    || auto_mute_decision.is_some();
+                    || inner.auto_effects.mute;
                 let previous_state = inner
                     .renderer_slots
                     .get(&rid)
@@ -6888,6 +6912,285 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_auto_pause_merges_sources_and_preserves_manual_pause() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let mut policy = auto_replay(&[(AutoCondition::Fullscreen, AutoAction::Pause)]);
+        policy.fullscreen_scope = crate::settings::AutoScope::AllDisplays;
+        router.attach_settings(settings_with_auto_replay(policy).await);
+        let r1 = RendererHandle::test_stub("r1", "video");
+        mgr.register_test_handle(r1.clone()).await;
+        router.register_renderer(r1).await;
+        let a = router.register_display(reg("A", 1920, 1080)).await;
+        let r2 = RendererHandle::test_stub("r2", "video");
+        mgr.register_test_handle(r2.clone()).await;
+        router.register_renderer(r2).await;
+        let b = router.register_display(reg("B", 1920, 1080)).await;
+        router.relink_displays_to(&[b.id], "r2").await;
+        router
+            .update_display_window_state(a.id, ar::FLAG_FULLSCREEN)
+            .await;
+        assert!(router.is_paused("r1").await && router.is_paused("r2").await);
+        assert!(
+            router
+                .snapshot_display(b.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        let c = router.register_display(reg("C", 1920, 1080)).await;
+        assert!(
+            router
+                .snapshot_display(c.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        router
+            .update_display_window_state(b.id, ar::FLAG_FULLSCREEN)
+            .await;
+        router.update_display_window_state(a.id, 0).await;
+        assert!(router.is_paused("r1").await && router.is_paused("r2").await);
+        router.set_display_paused(a.id, true).await.unwrap();
+        router.unregister_display(b.id).await;
+        assert!(router.snapshot_display(a.id).await.unwrap().manual_paused);
+        assert!(
+            !router
+                .snapshot_display(c.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        assert!(!router.inner.lock().await.auto_effects.pause_all);
+    }
+
+    #[tokio::test]
+    async fn scoped_auto_mute_is_global_and_survives_local_pause() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        router.attach_settings(
+            settings_with_auto_replay(auto_replay(&[
+                (AutoCondition::Focused, AutoAction::Mute),
+                (AutoCondition::Fullscreen, AutoAction::Pause),
+            ]))
+            .await,
+        );
+        let r1 = RendererHandle::test_stub("r1", "video");
+        mgr.register_test_handle(r1.clone()).await;
+        router.register_renderer(r1).await;
+        let a = router.register_display(reg("A", 1920, 1080)).await;
+        let r2 = RendererHandle::test_stub("r2", "video");
+        mgr.register_test_handle(r2.clone()).await;
+        router.register_renderer(r2).await;
+        let b = router.register_display(reg("B", 1920, 1080)).await;
+        router.relink_displays_to(&[b.id], "r2").await;
+        router
+            .update_display_window_state(a.id, ar::FLAG_ACTIVE | ar::FLAG_FULLSCREEN)
+            .await;
+        assert!(router.is_paused("r1").await);
+        assert!(router.is_muted("r2").await);
+        router
+            .update_display_window_state(a.id, ar::FLAG_ACTIVE)
+            .await;
+        assert!(!router.is_paused("r1").await);
+        assert!(router.is_muted("r1").await && router.is_muted("r2").await);
+        router.update_display_window_state(a.id, 0).await;
+        assert!(!router.is_muted("r1").await && !router.is_muted("r2").await);
+    }
+
+    #[tokio::test]
+    async fn scoped_session_policy_ignores_display_overrides_and_handles_new_renderers() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let policy = auto_replay(&[(AutoCondition::SessionLocked, AutoAction::Stop)]);
+        let settings = settings_with_auto_replay(policy).await;
+        settings.update(|s| {
+            let mut override_policy = policy;
+            override_policy.session_locked = AutoAction::None;
+            s.displays.entry("A".into()).or_default().auto_replay = Some(override_policy);
+        });
+        router.attach_settings(settings);
+        router.update_session_state(Some(true), None).await;
+        assert!(router.inner.lock().await.auto_effects.stop);
+        let renderer = RendererHandle::test_stub("r1", "video");
+        mgr.register_test_handle(renderer.clone()).await;
+        router.register_renderer(renderer).await;
+        assert!(mgr.get("r1").await.is_none());
+        let a = router.register_display(reg("A", 1920, 1080)).await;
+        assert!(router
+            .snapshot_display(a.id)
+            .await
+            .unwrap()
+            .links
+            .iter()
+            .all(|l| !l.active));
+        router.update_session_state(Some(false), None).await;
+        assert!(!router.inner.lock().await.auto_effects.stop);
+    }
+
+    #[tokio::test]
+    async fn fullscreen_stop_scopes_share_renderer_and_release_independently() {
+        for scope in [
+            crate::settings::AutoScope::CurrentDisplay,
+            crate::settings::AutoScope::AllDisplays,
+        ] {
+            let mgr = Arc::new(RendererManager::new_default());
+            let router = Router::new(mgr.clone());
+            let mut policy = auto_replay(&[(AutoCondition::Fullscreen, AutoAction::Stop)]);
+            policy.fullscreen_scope = scope;
+            router.attach_settings(settings_with_auto_replay(policy).await);
+            let r1 = RendererHandle::test_stub("r1", "video");
+            mgr.register_test_handle(r1.clone()).await;
+            router.register_renderer(r1).await;
+            let a = router.register_display(reg("A", 1920, 1080)).await;
+            let b = router.register_display(reg("B", 1920, 1080)).await;
+            let r2 = RendererHandle::test_stub("r2", "video");
+            mgr.register_test_handle(r2.clone()).await;
+            router.register_renderer(r2).await;
+            let c = router.register_display(reg("C", 1920, 1080)).await;
+            router.relink_displays_to(&[c.id], "r2").await;
+            router
+                .update_display_window_state(a.id, ar::FLAG_FULLSCREEN)
+                .await;
+            assert!(mgr.get("r1").await.is_none());
+            assert_eq!(
+                mgr.get("r2").await.is_none(),
+                scope == crate::settings::AutoScope::AllDisplays
+            );
+            assert!(router
+                .inner
+                .lock()
+                .await
+                .table
+                .links_for_display(b.id)
+                .iter()
+                .all(|link| !link.enabled));
+            router
+                .update_display_window_state(b.id, ar::FLAG_FULLSCREEN)
+                .await;
+            router.update_display_window_state(a.id, 0).await;
+            assert!(router
+                .inner
+                .lock()
+                .await
+                .table
+                .links_for_display(a.id)
+                .iter()
+                .all(|link| !link.enabled));
+            router.update_display_window_state(b.id, 0).await;
+            assert!(router
+                .inner
+                .lock()
+                .await
+                .table
+                .links_for_display(a.id)
+                .iter()
+                .all(|link| link.enabled));
+            assert!(router.inner.lock().await.auto_stopped_renderers.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_auto_stop_preserves_pause_mute_and_manual_stop() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let mut policy = auto_replay(&[
+            (AutoCondition::Fullscreen, AutoAction::Stop),
+            (AutoCondition::Maximized, AutoAction::Pause),
+            (AutoCondition::Focused, AutoAction::Mute),
+        ]);
+        policy.maximized_scope = crate::settings::AutoScope::AllDisplays;
+        policy.fullscreen_scope = crate::settings::AutoScope::AllDisplays;
+        router.attach_settings(settings_with_auto_replay(policy).await);
+        let r1 = RendererHandle::test_stub("r1", "video");
+        mgr.register_test_handle(r1.clone()).await;
+        router.register_renderer(r1).await;
+        let a = router.register_display(reg("A", 1920, 1080)).await;
+        let r2 = RendererHandle::test_stub("r2", "video");
+        mgr.register_test_handle(r2.clone()).await;
+        router.register_renderer(r2).await;
+        let b = router.register_display(reg("B", 1920, 1080)).await;
+        router.relink_displays_to(&[b.id], "r2").await;
+        router
+            .update_display_window_state(b.id, ar::FLAG_MAXIMIZED)
+            .await;
+        router
+            .update_display_window_state(a.id, ar::FLAG_FULLSCREEN | ar::FLAG_ACTIVE)
+            .await;
+        assert!(mgr.get("r1").await.is_none() && mgr.get("r2").await.is_none());
+        assert!(
+            !router
+                .snapshot_display(b.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        router.set_manual_stop(true).await;
+        router
+            .update_display_window_state(a.id, ar::FLAG_ACTIVE)
+            .await;
+        {
+            let inner = router.inner.lock().await;
+            assert!(inner.manual_stopped);
+            assert!(!inner.auto_effects.stop);
+            assert!(inner.auto_effects.pause_all && inner.auto_effects.mute);
+        }
+        router.update_display_window_state(b.id, 0).await;
+        let inner = router.inner.lock().await;
+        assert!(!inner.auto_effects.pause_all);
+        assert!(inner.auto_effects.mute && inner.manual_stopped);
+        assert!(inner
+            .table
+            .links_for_display(a.id)
+            .iter()
+            .all(|l| !l.enabled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_auto_pause_delays_each_source_and_rejects_stale_tokens() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let mut policy = auto_replay(&[(AutoCondition::Fullscreen, AutoAction::Pause)]);
+        policy.fullscreen_scope = crate::settings::AutoScope::AllDisplays;
+        policy.resume_delay_ms = 100;
+        router.attach_settings(settings_with_auto_replay(policy).await);
+        let a = router.register_display(reg("A", 1920, 1080)).await;
+        let b = router.register_display(reg("B", 1920, 1080)).await;
+        router
+            .update_display_window_state(a.id, ar::FLAG_FULLSCREEN)
+            .await;
+        router
+            .update_display_window_state(b.id, ar::FLAG_FULLSCREEN)
+            .await;
+        router.update_display_window_state(a.id, 0).await;
+        let stale = router.inner.lock().await.displays[&a.id]
+            .auto_replay
+            .resume_token;
+        router
+            .update_display_window_state(a.id, ar::FLAG_FULLSCREEN)
+            .await;
+        router
+            .finish_auto_replay_resume(ar::Source::Display(a.id), stale)
+            .await;
+        assert!(router.inner.lock().await.auto_effects.pause_all);
+        router.update_display_window_state(a.id, 0).await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        router.refresh_auto_policy(false).await;
+        assert!(router.inner.lock().await.auto_effects.pause_all);
+        router.update_display_window_state(b.id, 0).await;
+        assert!(
+            router
+                .snapshot_display(a.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        router.refresh_auto_policy(false).await;
+        assert!(!router.inner.lock().await.auto_effects.pause_all);
+    }
+
+    #[tokio::test]
     async fn auto_replay_action_priority_prefers_pause_over_mute() {
         let mgr = Arc::new(RendererManager::new_default());
         let router = Router::new(mgr.clone());
@@ -6972,7 +7275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_renderer_stops_only_after_every_display_is_inhibited() {
+    async fn auto_stop_inhibits_all_displays_from_one_source() {
         let mgr = Arc::new(RendererManager::new_default());
         let router = Router::new(mgr.clone());
         router.attach_settings(
@@ -6991,11 +7294,14 @@ mod tests {
         router
             .update_display_window_state(first.id, ar::FLAG_FULLSCREEN)
             .await;
-        assert!(mgr.get("r1").await.is_some());
-        assert!(matches!(
-            router.snapshot_renderer("r1").await.unwrap().state,
-            RendererLifecycleState::Running { .. }
-        ));
+        assert!(mgr.get("r1").await.is_none());
+        assert!(router
+            .snapshot_display(second.id)
+            .await
+            .unwrap()
+            .links
+            .iter()
+            .all(|link| !link.active));
 
         router
             .update_display_window_state(second.id, ar::FLAG_FULLSCREEN)

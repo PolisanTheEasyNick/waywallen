@@ -1651,6 +1651,11 @@ enum AutoAction {
   AUTO_ACTION_STOP = 3;
 }
 
+enum AutoScope {
+  AUTO_SCOPE_CURRENT_DISPLAY = 0;
+  AUTO_SCOPE_ALL_DISPLAYS = 1;
+}
+
 message AutoReplayPolicy {
   reserved 1, 2, 3;
   AutoAction any_window = 10;
@@ -1660,6 +1665,10 @@ message AutoReplayPolicy {
   AutoAction session_locked = 14;
   AutoAction session_inactive = 15;
   optional uint32 resume_delay_ms = 16;
+  AutoScope any_window_scope = 17;
+  AutoScope focused_scope = 18;
+  AutoScope maximized_scope = 19;
+  AutoScope fullscreen_scope = 20;
 }
 
 enum PauseEffectKind {

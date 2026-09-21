@@ -221,6 +221,7 @@ using proto::SettingsSetRequest;
 using proto::TransitionConfig;
 using proto::AlignGadget::Align;
 using proto::AutoActionGadget::AutoAction;
+using proto::AutoScopeGadget::AutoScope;
 using proto::FillModeGadget::FillMode;
 using proto::LayoutSourceGadget::LayoutSource;
 using proto::PauseEffectKindGadget::PauseEffectKind;

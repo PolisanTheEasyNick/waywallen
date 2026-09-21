@@ -2,7 +2,7 @@ use super::*;
 
 impl DisplayState {
     pub(super) fn display_paused(&self) -> bool {
-        self.manual_paused || self.auto_replay.requested.action == AutoAction::Pause
+        self.manual_paused || self.auto_paused
     }
 
     pub(super) fn consumption_changed(&mut self, was_paused: bool) {
@@ -10,12 +10,6 @@ impl DisplayState {
             self.invalidate_consumption();
             self.resume_frame_requested = !self.display_paused();
         }
-    }
-
-    pub(super) fn set_auto_decision(&mut self, decision: auto_replay::Decision) {
-        let was_paused = self.display_paused();
-        self.auto_replay.requested = decision;
-        self.consumption_changed(was_paused);
     }
 }
 

@@ -433,8 +433,8 @@
         <translation>已暂停</translation>
     </message>
     <message>
-        <source>Paused by playback policy</source>
-        <translation>播放策略已暂停</translation>
+        <source>Automatically paused</source>
+        <translation>已自动暂停</translation>
     </message>
     <message>
         <location filename="../qml/page/DisplaysPage.qml" line="13"/>
@@ -1653,6 +1653,9 @@ Related display: #%1</source>
 </context>
 <context>
     <name>SettingsPage</name>
+    <message><source>Current display</source><translation>当前显示器</translation></message>
+    <message><source>All displays</source><translation>所有显示器</translation></message>
+    <message><source>Applies to</source><translation>作用范围</translation></message>
     <message>
         <location filename="../qml/page/SettingsPage.qml" line="15"/>
         <source>Settings</source>
