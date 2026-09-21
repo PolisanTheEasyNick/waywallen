@@ -175,6 +175,10 @@ MD.Page {
         id: renameQuery
     }
 
+    W.DisplayPauseSetQuery {
+        id: displayPauseQuery
+    }
+
     W.CanvasMutationQuery {
         id: canvasMutationQuery
         forwardError: false
@@ -1111,6 +1115,43 @@ MD.Page {
                                 enabled: !canvasEditor.dirty
                                 icon.name: MD.Token.icon.close
                                 onClicked: root.clearSelection()
+                            }
+                        }
+
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            Repeater {
+                                model: root.selectedDisplayObject ? [root.selectedDisplayObject] : (W.App.displayManager.displays || []).filter(d => d.canvasId === root.selectedCanvasObject?.id)
+                                delegate: RowLayout {
+                                    required property var modelData
+                                    spacing: 4
+
+                                    MD.Text {
+                                        visible: root.selectedKind === "canvas"
+                                        text: parent.modelData.displayLabel
+                                        typescale: MD.Token.typescale.label_medium
+                                    }
+                                    MD.IconButton {
+                                        readonly property var displayObject: parent.modelData
+                                        enabled: !displayPauseQuery.querying
+                                        icon.name: displayObject.manualPaused ? MD.Token.icon.play_arrow : MD.Token.icon.pause
+                                        MD.ToolTip.visible: hovered
+                                        MD.ToolTip.text: displayObject.manualPaused ? qsTr("Resume display") : qsTr("Pause display")
+                                        onClicked: {
+                                            displayPauseQuery.displayId = displayObject.id;
+                                            displayPauseQuery.paused = !displayObject.manualPaused;
+                                            displayPauseQuery.reload();
+                                        }
+                                    }
+                                    MD.Text {
+                                        visible: parent.modelData.effectivePaused
+                                        text: parent.modelData.manualPaused ? qsTr("Paused") : qsTr("Paused by playback policy")
+                                        typescale: MD.Token.typescale.label_medium
+                                        color: MD.Token.color.on_surface_variant
+                                    }
+                                }
                             }
                         }
 

@@ -1233,6 +1233,16 @@ pub(super) async fn dispatch_inner(
             Res::CanvasDelete(pb::Empty {})
         }
 
+        Req::DisplayPauseSet(r) => {
+            let display = state
+                .router
+                .set_display_paused(r.display_id, r.paused)
+                .await?;
+            Res::DisplayPauseSet(pb::DisplayPauseSetResponse {
+                display: Some(display_snapshot_to_pb(display, &state.settings)),
+            })
+        }
+
         Req::DisplayRename(r) => {
             let new_alias = if r.clear || r.alias.trim().is_empty() {
                 None

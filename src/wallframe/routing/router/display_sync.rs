@@ -106,7 +106,7 @@ impl Router {
                 content_token,
                 presentation_config_generation,
             });
-            if let Some(frame) = replay {
+            if let Some(frame) = replay.filter(|_| !s.display_paused()) {
                 let _ = s.tx.send(DisplayOutEvent::Frame {
                     renderer: renderer.clone(),
                     buffer_generation: wire_generation,

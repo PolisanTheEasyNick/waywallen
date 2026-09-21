@@ -40,6 +40,7 @@ use super::auto_replay;
 use super::table::{Link, LinkDstRect, LinkId, LinkProjection, LinkSrcRect, RoutingTable};
 
 mod composition;
+mod consumption;
 mod deadline;
 mod display_sync;
 mod lifecycle;
@@ -398,6 +399,8 @@ pub struct RendererSnapshot {
 #[derive(Debug, Clone)]
 pub struct DisplaySnapshot {
     pub id: DisplayId,
+    pub manual_paused: bool,
+    pub effective_paused: bool,
     pub name: String,
     /// Stable per-display key advertised by v4 consumers, used as the
     /// settings store key for layout overrides.
@@ -499,6 +502,9 @@ struct DisplayState {
     /// the resolved rule policy.
     auto_replay: auto_replay::State,
     consumption_epoch: Arc<AtomicU64>,
+    manual_paused: bool,
+    resume_frame_requested: bool,
+    published_pause: Option<(bool, bool)>,
 }
 
 #[derive(Clone)]
@@ -1028,10 +1034,11 @@ impl Router {
         let Some(binding) = display.binding.as_ref() else {
             return false;
         };
-        inner
-            .renderer_slots
-            .get(&binding.renderer.id)
-            .is_some_and(|slot| slot.state.activity() == Some(RendererActivity::Paused))
+        display.display_paused()
+            || inner
+                .renderer_slots
+                .get(&binding.renderer.id)
+                .is_some_and(|slot| slot.state.activity() == Some(RendererActivity::Paused))
     }
 
     fn resolved_audio_fade_ms(&self) -> u32 {
@@ -1806,6 +1813,9 @@ impl Router {
                     accepted: false,
                     auto_replay: auto_replay::State::new(),
                     consumption_epoch: Arc::new(AtomicU64::new(1)),
+                    manual_paused: false,
+                    resume_frame_requested: false,
+                    published_pause: None,
                 },
             );
             let canvas_id = canvas.as_ref().map(|(canvas_id, _)| canvas_id.clone());
@@ -2272,10 +2282,7 @@ impl Router {
             let inner = self.inner.lock().await;
             inner.displays.keys().copied().collect()
         };
-        for display_id in display_ids {
-            let action = self.update_auto_state(display_id, None).await;
-            self.run_auto_state_action(action).await;
-        }
+        self.refresh_auto_states(display_ids).await;
     }
 
     /// Subscribe to router events (display add/change/remove). The
@@ -2349,7 +2356,7 @@ impl Router {
                     .table
                     .links_for_renderer(&renderer_id)
                     .into_iter()
-                    .any(|link| link.enabled && inner.displays.contains_key(&link.display_id));
+                    .any(|link| inner.has_frame_demand(&link));
                 let waits = inner
                     .release_waits
                     .get(&renderer_id)
@@ -2927,6 +2934,8 @@ impl Router {
         Some(DisplaySnapshot {
             id,
             name: s.info.name.clone(),
+            manual_paused: s.manual_paused,
+            effective_paused: inner.effective_display_paused(s),
             instance_id: s.info.instance_id.clone(),
             settings_key,
             width: s.info.metrics.width,
@@ -3072,6 +3081,8 @@ impl Router {
                 Some(DisplaySnapshot {
                     id,
                     name: s.info.name.clone(),
+                    manual_paused: s.manual_paused,
+                    effective_paused: inner.effective_display_paused(s),
                     instance_id: s.info.instance_id.clone(),
                     settings_key,
                     width: s.info.metrics.width,
@@ -3305,7 +3316,7 @@ impl Router {
             .table
             .links_for_renderer(renderer_id)
             .into_iter()
-            .filter(|link| link.enabled)
+            .filter(|link| inner.has_frame_demand(link))
             .filter_map(|link| inner.displays.get(&link.display_id))
             .filter_map(|state| {
                 let binding = state.binding.as_ref()?;
@@ -3378,37 +3389,16 @@ impl Router {
                     .filter(|l| l.enabled)
                     .collect();
                 let has_active_link = !links.is_empty();
-                // Auto replay only matters when at least one active link
-                // exists; no-link pause is handled by ref-count.
-                let (auto_pause_requested, auto_mute_decision) = if has_active_link {
-                    links.iter().fold(
-                        (false, None::<auto_replay::Decision>),
-                        |(auto_pause_requested, auto_mute_decision), l| {
-                            if let Some(display) = inner.displays.get(&l.display_id) {
-                                match display.auto_replay.requested.action {
-                                    AutoAction::Pause => (true, auto_mute_decision),
-                                    AutoAction::Mute => {
-                                        let decision = display.auto_replay.requested;
-                                        let next = auto_mute_decision.or(Some(decision));
-                                        (auto_pause_requested, next)
-                                    }
-                                    AutoAction::Stop | AutoAction::None => {
-                                        (auto_pause_requested, auto_mute_decision)
-                                    }
-                                }
-                            } else {
-                                (auto_pause_requested, auto_mute_decision)
-                            }
-                        },
-                    )
-                } else {
-                    (false, None)
-                };
+                let has_frame_demand = links.iter().any(|link| inner.has_frame_demand(link));
+                let auto_mute_decision = links.iter().find_map(|link| {
+                    let decision = inner.displays.get(&link.display_id)?.auto_replay.requested;
+                    (decision.action == AutoAction::Mute).then_some(decision)
+                });
                 let manual_paused =
                     inner.manual_paused || inner.renderer_manual_paused.contains(&rid);
                 let manual_muted = inner.manual_muted;
                 let other_playback_active = inner.other_playback_active;
-                let should_pause = manual_paused || !has_active_link || auto_pause_requested;
+                let should_pause = manual_paused || !has_frame_demand;
                 let should_mute = manual_muted
                     || other_playback_active
                     || !has_active_link
@@ -3580,6 +3570,7 @@ impl Router {
         for display_id in display_ids {
             self.reconcile_presentation_config(display_id).await;
         }
+        self.reconcile_display_consumption().await;
         self.refresh_runtime_health().await;
         for id in changed_ids {
             if let Some(snap) = self.snapshot_renderer(&id).await {
@@ -5884,6 +5875,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn display_pause_excludes_only_its_consumer_and_invalidates_queued_frames() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let (renderer, mut records) = RendererHandle::test_stub_with_frame_records("r1", "video");
+        renderer.test_publish_pool(fake_published_pool(1, 1920, 1080));
+        mgr.register_test_handle(renderer.clone()).await;
+        router.register_renderer(renderer).await;
+        let mut a = router.register_display(reg("A", 1920, 1080)).await;
+        let mut b = router.register_display(reg("B", 1920, 1080)).await;
+        drain_display_events(&mut a.rx);
+        drain_display_events(&mut b.rx);
+        router.on_renderer_frame("r1", 1, 0, 1, 1).await;
+        let old = drain_display_events(&mut a.rx);
+        let permit = old
+            .iter()
+            .find_map(|e| match e {
+                DisplayOutEvent::Frame { consumption, .. } => Some(consumption.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(permit.is_current());
+        drain_display_events(&mut b.rx);
+        while records.try_recv().is_ok() {}
+        let paused = router.set_display_paused(a.id, true).await.unwrap();
+        assert!(paused.manual_paused && paused.effective_paused);
+        assert!(paused.links.iter().any(|link| link.active));
+        assert!(!permit.is_current());
+        assert!(!router.is_paused("r1").await);
+        assert!(drain_display_events(&mut a.rx).is_empty());
+        router.on_renderer_frame("r1", 1, 0, 2, 2).await;
+        assert!(a.rx.try_recv().is_err());
+        assert!(drain_display_events(&mut b.rx)
+            .iter()
+            .any(|e| matches!(e, DisplayOutEvent::Frame { seq: 2, .. })));
+        match records.try_recv().unwrap() {
+            crate::wallframe::sync::FrameRecord::Register { consumers, .. } => {
+                assert_eq!(consumers.len(), 1);
+                assert_eq!(consumers[0].display_id, b.id);
+            }
+            _ => panic!("expected registration"),
+        }
+        router.set_display_paused(b.id, true).await.unwrap();
+        assert!(router.is_paused("r1").await);
+        while records.try_recv().is_ok() {}
+        router.on_renderer_frame("r1", 1, 0, 3, 3).await;
+        match records.try_recv().unwrap() {
+            crate::wallframe::sync::FrameRecord::Register { consumers, .. } => {
+                assert!(consumers.is_empty())
+            }
+            _ => panic!("expected zero-consumer registration"),
+        }
+        router.set_display_paused(a.id, false).await.unwrap();
+        assert!(!router.is_paused("r1").await);
+        assert!(!permit.is_current());
+        assert!(router.snapshot_display(b.id).await.unwrap().manual_paused);
+        assert!(router.set_display_paused(u64::MAX, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn display_pause_combines_manual_auto_and_global_sources() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        router.attach_settings(
+            settings_with_auto_replay(auto_replay(&[(
+                AutoCondition::Fullscreen,
+                AutoAction::Pause,
+            )]))
+            .await,
+        );
+        let renderer = RendererHandle::test_stub("r1", "scene");
+        mgr.register_test_handle(renderer.clone()).await;
+        router.register_renderer(renderer).await;
+        let a = router.register_display(reg("A", 1920, 1080)).await;
+        let b = router.register_display(reg("B", 1920, 1080)).await;
+        router
+            .update_display_window_state(a.id, ar::FLAG_FULLSCREEN)
+            .await;
+        assert!(
+            router
+                .snapshot_display(a.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        assert!(
+            !router
+                .snapshot_display(b.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        assert!(!router.is_paused("r1").await);
+        router.set_display_paused(a.id, true).await.unwrap();
+        router.update_display_window_state(a.id, 0).await;
+        assert!(
+            router
+                .snapshot_display(a.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        router.set_manual_pause(true).await;
+        let snap = router.set_display_paused(a.id, false).await.unwrap();
+        assert!(!snap.manual_paused && snap.effective_paused);
+        router.set_manual_pause(false).await;
+        assert!(
+            !router
+                .snapshot_display(a.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        assert!(
+            !router
+                .snapshot_display(b.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        router.set_renderer_paused("r1", true).await;
+        assert!(
+            router
+                .snapshot_display(a.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+    }
+
+    #[tokio::test]
+    async fn display_pause_gates_image_replay_across_pool_replacement() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let renderer = RendererHandle::test_stub("r1", "image");
+        renderer.test_publish_pool(fake_published_pool(1, 1920, 1080));
+        mgr.register_test_handle(renderer.clone()).await;
+        router.register_renderer(renderer.clone()).await;
+        let mut display = router.register_display(reg("A", 1920, 1080)).await;
+        router.set_display_paused(display.id, true).await.unwrap();
+        drain_display_events(&mut display.rx);
+        renderer.test_publish_pool(fake_published_pool(2, 1920, 1080));
+        renderer.test_set_latest_frame(FrameSnapshot {
+            buffer_generation: 2,
+            buffer_index: 0,
+            seq: 42,
+            release_point: 7,
+        });
+        router.on_renderer_bind("r1").await;
+        let events = drain_display_events(&mut display.rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DisplayOutEvent::Bind { .. })));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DisplayOutEvent::Frame { .. })));
+        assert!(
+            router
+                .snapshot_display(display.id)
+                .await
+                .unwrap()
+                .manual_paused
+        );
+    }
+
+    #[tokio::test]
+    async fn display_pause_resume_requests_one_frame_and_is_idempotent() {
+        let mgr = Arc::new(RendererManager::new_default());
+        let router = Router::new(mgr.clone());
+        let (renderer, peer) = RendererHandle::test_stub_with_peer("r1", "image");
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        mgr.register_test_handle(renderer.clone()).await;
+        router.register_renderer(renderer).await;
+        let a = router.register_display(reg("A", 1920, 1080)).await;
+        let _b = router.register_display(reg("B", 1920, 1080)).await;
+        drain_renderer_controls(&peer);
+        router.set_display_paused(a.id, true).await.unwrap();
+        router.set_display_paused(a.id, false).await.unwrap();
+        let (message, _) = crate::wallframe::ipc::uds::recv_control(&peer).unwrap();
+        assert!(matches!(message, ControlMsg::RequestFrame));
+        router.set_display_paused(a.id, false).await.unwrap();
+        assert!(crate::wallframe::ipc::uds::recv_control(&peer).is_err());
+    }
+
+    #[tokio::test]
     async fn queued_bind_keeps_the_exact_published_pool() {
         let mgr = Arc::new(RendererManager::new_default());
         let router = Router::new(mgr.clone());
@@ -7699,7 +7875,21 @@ mod tests {
 
         router.relink_displays_to(&[a.id], "r2").await;
 
-        assert!(router.is_paused("r2").await);
+        assert!(!router.is_paused("r2").await);
+        assert!(
+            router
+                .snapshot_display(a.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
+        assert!(
+            !router
+                .snapshot_display(b.id)
+                .await
+                .unwrap()
+                .effective_paused
+        );
     }
 
     #[tokio::test(start_paused = true)]

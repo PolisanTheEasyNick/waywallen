@@ -423,6 +423,22 @@
 <context>
     <name>DisplaysPage</name>
     <message>
+        <source>Pause display</source>
+        <translation>Приостановить дисплей</translation>
+    </message>
+    <message>
+        <source>Resume display</source>
+        <translation>Возобновить дисплей</translation>
+    </message>
+    <message>
+        <source>Paused</source>
+        <translation>Приостановлено</translation>
+    </message>
+    <message>
+        <source>Paused by playback policy</source>
+        <translation>Приостановлено политикой воспроизведения</translation>
+    </message>
+    <message>
         <location filename="../qml/page/DisplaysPage.qml" line="13"/>
         <source>Displays</source>
         <translation>Мониторы</translation>

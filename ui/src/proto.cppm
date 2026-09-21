@@ -116,6 +116,8 @@ using proto::DisplayLayoutSetResponse;
 using proto::DisplayLinkInfo;
 using proto::DisplayListRequest;
 using proto::DisplayListResponse;
+using proto::DisplayPauseSetRequest;
+using proto::DisplayPauseSetResponse;
 using proto::DisplayRenameRequest;
 using proto::DisplayRenameResponse;
 using proto::LayoutOverride;

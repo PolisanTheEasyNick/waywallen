@@ -421,6 +421,22 @@
 <context>
     <name>DisplaysPage</name>
     <message>
+        <source>Pause display</source>
+        <translation>暂停显示器</translation>
+    </message>
+    <message>
+        <source>Resume display</source>
+        <translation>恢复显示器</translation>
+    </message>
+    <message>
+        <source>Paused</source>
+        <translation>已暂停</translation>
+    </message>
+    <message>
+        <source>Paused by playback policy</source>
+        <translation>播放策略已暂停</translation>
+    </message>
+    <message>
         <location filename="../qml/page/DisplaysPage.qml" line="13"/>
         <source>Displays</source>
         <translation>显示器</translation>

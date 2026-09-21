@@ -351,8 +351,15 @@ impl Router {
                 inner.displays.keys().copied().collect()
             }
         };
+        self.refresh_auto_states(display_ids).await;
+    }
+
+    pub(super) async fn refresh_auto_states(self: &Arc<Self>, display_ids: Vec<DisplayId>) {
+        let mut actions = Vec::with_capacity(display_ids.len());
         for display_id in display_ids {
-            let action = self.update_auto_state(display_id, None).await;
+            actions.push(self.update_auto_state(display_id, None).await);
+        }
+        for action in actions {
             self.run_auto_state_action(action).await;
         }
     }
@@ -390,7 +397,7 @@ impl Router {
             let cancel_resume = state.auto_replay.pending_resume.take().is_some();
             let reconcile = state.auto_replay.requested != new_raw;
             if reconcile {
-                state.auto_replay.requested = new_raw;
+                state.set_auto_decision(new_raw);
             }
             if cancel_resume {
                 AutoStateAction::CancelResume {
@@ -406,7 +413,7 @@ impl Router {
             let delay = Duration::from_millis(u64::from(policy.effective_resume_delay_ms()));
             if delay.is_zero() {
                 let cancel_resume = state.auto_replay.pending_resume.take().is_some();
-                state.auto_replay.requested = new_raw;
+                state.set_auto_decision(new_raw);
                 if cancel_resume {
                     AutoStateAction::CancelResume {
                         display_id,
@@ -432,7 +439,7 @@ impl Router {
                 }
             }
         } else {
-            state.auto_replay.requested = new_raw;
+            state.set_auto_decision(new_raw);
             AutoStateAction::Noop
         }
     }
@@ -482,7 +489,7 @@ impl Router {
             if state.auto_replay.raw.is_active() || !state.auto_replay.requested.is_active() {
                 false
             } else {
-                state.auto_replay.requested = state.auto_replay.raw;
+                state.set_auto_decision(state.auto_replay.raw);
                 true
             }
         };

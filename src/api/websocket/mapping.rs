@@ -312,6 +312,8 @@ pub(super) fn display_snapshot_to_pb(
     let override_prefs = settings.display_prefs(layout_key).unwrap_or_default();
     pb::DisplayInfo {
         display_id: s.id,
+        manual_paused: s.manual_paused,
+        effective_paused: s.effective_paused,
         name: s.name,
         width: s.width,
         height: s.height,
