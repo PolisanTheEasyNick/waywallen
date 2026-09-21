@@ -1900,6 +1900,70 @@ Related display: #%1</source>
         <translation>效果</translation>
     </message>
     <message>
+        <source>Wallpaper transition</source>
+        <translation>壁纸切换效果</translation>
+    </message>
+    <message>
+        <source>Transition duration</source>
+        <translation>切换时长</translation>
+    </message>
+    <message>
+        <source>Fade</source>
+        <translation>淡入淡出</translation>
+    </message>
+    <message>
+        <source>Wipe</source>
+        <translation>擦除</translation>
+    </message>
+    <message>
+        <source>Grow</source>
+        <translation>扩散</translation>
+    </message>
+    <message>
+        <source>Wipe direction</source>
+        <translation>擦除方向</translation>
+    </message>
+    <message>
+        <source>Grow center, horizontal</source>
+        <translation>扩散中心（水平）</translation>
+    </message>
+    <message>
+        <source>Grow center, vertical</source>
+        <translation>扩散中心（垂直）</translation>
+    </message>
+    <message>
+        <source>Left to right</source>
+        <translation>从左到右</translation>
+    </message>
+    <message>
+        <source>Top left to bottom right</source>
+        <translation>从左上到右下</translation>
+    </message>
+    <message>
+        <source>Top to bottom</source>
+        <translation>从上到下</translation>
+    </message>
+    <message>
+        <source>Top right to bottom left</source>
+        <translation>从右上到左下</translation>
+    </message>
+    <message>
+        <source>Right to left</source>
+        <translation>从右到左</translation>
+    </message>
+    <message>
+        <source>Bottom right to top left</source>
+        <translation>从右下到左上</translation>
+    </message>
+    <message>
+        <source>Bottom to top</source>
+        <translation>从下到上</translation>
+    </message>
+    <message>
+        <source>Bottom left to top right</source>
+        <translation>从左下到右上</translation>
+    </message>
+    <message>
         <location filename="../qml/page/SettingsPage.qml" line="894"/>
         <source>Blur while paused</source>
         <translation>暂停时模糊</translation>

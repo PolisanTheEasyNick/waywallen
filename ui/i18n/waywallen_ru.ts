@@ -1906,6 +1906,70 @@ Related display: #%1</source>
         <translation>Эффект</translation>
     </message>
     <message>
+        <source>Wallpaper transition</source>
+        <translation>Эффект смены обоев</translation>
+    </message>
+    <message>
+        <source>Transition duration</source>
+        <translation>Длительность перехода</translation>
+    </message>
+    <message>
+        <source>Fade</source>
+        <translation>Плавное затухание</translation>
+    </message>
+    <message>
+        <source>Wipe</source>
+        <translation>Стирание</translation>
+    </message>
+    <message>
+        <source>Grow</source>
+        <translation>Расширение</translation>
+    </message>
+    <message>
+        <source>Wipe direction</source>
+        <translation>Направление стирания</translation>
+    </message>
+    <message>
+        <source>Grow center, horizontal</source>
+        <translation>Центр расширения по горизонтали</translation>
+    </message>
+    <message>
+        <source>Grow center, vertical</source>
+        <translation>Центр расширения по вертикали</translation>
+    </message>
+    <message>
+        <source>Left to right</source>
+        <translation>Слева направо</translation>
+    </message>
+    <message>
+        <source>Top left to bottom right</source>
+        <translation>Из левого верхнего в правый нижний угол</translation>
+    </message>
+    <message>
+        <source>Top to bottom</source>
+        <translation>Сверху вниз</translation>
+    </message>
+    <message>
+        <source>Top right to bottom left</source>
+        <translation>Из правого верхнего в левый нижний угол</translation>
+    </message>
+    <message>
+        <source>Right to left</source>
+        <translation>Справа налево</translation>
+    </message>
+    <message>
+        <source>Bottom right to top left</source>
+        <translation>Из правого нижнего в левый верхний угол</translation>
+    </message>
+    <message>
+        <source>Bottom to top</source>
+        <translation>Снизу вверх</translation>
+    </message>
+    <message>
+        <source>Bottom left to top right</source>
+        <translation>Из левого нижнего в правый верхний угол</translation>
+    </message>
+    <message>
         <location filename="../qml/page/SettingsPage.qml" line="894"/>
         <source>Blur while paused</source>
         <translation>Размытие во время паузы</translation>

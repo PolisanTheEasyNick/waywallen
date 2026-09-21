@@ -1052,7 +1052,7 @@ MD.Page {
 
             SettingItem {
                 first: false
-                last: true
+                last: false
                 enabled: root._pauseEffect().kind
                     === WC.PauseEffectKind.PAUSE_EFFECT_KIND_BLUR
 
@@ -1093,10 +1093,8 @@ MD.Page {
                 }
             }
 
-            SettingHeader { text: qsTr("Transition") }
-
             SettingItem {
-                first: true
+                first: false
                 last: false
 
                 RowLayout {
