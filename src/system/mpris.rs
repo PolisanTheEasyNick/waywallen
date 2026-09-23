@@ -1,8 +1,13 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use zbus::fdo::{DBusProxy, PropertiesProxy};
@@ -22,6 +27,9 @@ const STATE_STOPPED: u32 = 0;
 const STATE_PLAYING: u32 = 1;
 const STATE_PAUSED: u32 = 2;
 const LOG_TEXT_MAX_CHARS: usize = 80;
+const MAX_ART_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ART_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DATA_URI_BYTES: usize = 12 * 1024 * 1024;
 
 /// Maximum allowed size for a single art_url field. Paths, file:// URLs,
 /// and typical https:// URLs fit comfortably. Large data: URIs are rejected.
@@ -37,10 +45,103 @@ enum PlayerMsg {
         snapshot: MprisSnapshot,
     },
     Gone(String),
+    ArtReady {
+        uri: String,
+        success: bool,
+    },
 }
 
 struct PlayerTask {
     handle: JoinHandle<()>,
+}
+
+/// Resolves MPRIS artwork into local files. The coordinator retains the raw
+/// URI in player snapshots; only outgoing renderer snapshots are rewritten.
+struct ArtCache {
+    dir: PathBuf,
+    client: Option<reqwest::Client>,
+    in_flight: HashSet<String>,
+    failed: HashSet<String>,
+}
+
+impl ArtCache {
+    async fn new(dir: PathBuf) -> Self {
+        if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+            log::warn!("mpris art cache unavailable at {}: {error}", dir.display());
+        } else if let Err(error) = cleanup_art_cache(&dir).await {
+            log::warn!("mpris art cache cleanup failed: {error:#}");
+        }
+        Self {
+            dir,
+            client: build_art_client()
+                .inspect_err(|error| log::warn!("mpris artwork client unavailable: {error:#}"))
+                .ok(),
+            in_flight: HashSet::new(),
+            failed: HashSet::new(),
+        }
+    }
+
+    async fn prepare_snapshot(
+        &mut self,
+        raw: &MprisSnapshot,
+        tx: &mpsc::Sender<PlayerMsg>,
+    ) -> MprisSnapshot {
+        let mut snapshot = raw.clone();
+        snapshot.art_url = self.resolve(&raw.art_url, true, tx).await;
+        snapshot.previous_art_url = self.resolve(&raw.previous_art_url, false, tx).await;
+        snapshot
+    }
+
+    async fn resolve(&mut self, raw: &str, fetch: bool, tx: &mpsc::Sender<PlayerMsg>) -> String {
+        if raw.is_empty() || raw.starts_with('/') {
+            return raw.to_string();
+        }
+        if !is_cacheable_art_uri(raw) {
+            return String::new();
+        }
+        let path = self.path_for(raw);
+        if is_regular_file(&path) {
+            touch(&path);
+            return path.to_string_lossy().into_owned();
+        }
+        if !fetch || self.failed.contains(raw) || !self.in_flight.insert(raw.to_string()) {
+            return String::new();
+        }
+        let client = self.client.clone();
+        let uri = raw.to_string();
+        let task_uri = uri.clone();
+        let dir = self.dir.clone();
+        let task_path = path;
+        let task_tx = tx.clone();
+        tokio::spawn(async move {
+            let success = match materialize_art(&task_uri, client.as_ref(), &dir, &task_path).await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!("mpris artwork {} failed: {error:#}", art_key(&task_uri));
+                    false
+                }
+            };
+            let _ = task_tx
+                .send(PlayerMsg::ArtReady {
+                    uri: task_uri,
+                    success,
+                })
+                .await;
+        });
+        String::new()
+    }
+
+    fn finished(&mut self, uri: &str, success: bool) {
+        self.in_flight.remove(uri);
+        if !success {
+            self.failed.insert(uri.to_string());
+        }
+    }
+
+    fn path_for(&self, uri: &str) -> PathBuf {
+        self.dir.join(format!("{}.img", art_key(uri)))
+    }
 }
 
 pub fn spawn(app: Arc<DaemonContext>) {
@@ -81,6 +182,7 @@ async fn run(app: Arc<DaemonContext>) -> Result<()> {
     let mut tasks: BTreeMap<String, PlayerTask> = BTreeMap::new();
     let mut players: BTreeMap<String, MprisSnapshot> = BTreeMap::new();
     let mut current = MprisSnapshot::default();
+    let mut art_cache = ArtCache::new(crate::settings::mpris_art_cache_dir()).await;
     let mut known_subscribers = BTreeMap::new();
     let mut discovered = 0usize;
 
@@ -110,7 +212,15 @@ async fn run(app: Arc<DaemonContext>) -> Result<()> {
     let initial_targets = updated_subscribers(&known_subscribers, &initial_subscribers);
     known_subscribers = initial_subscribers;
     if !initial_targets.is_empty() {
-        publish_to_renderers(&app, &current, &initial_targets, "subscription").await;
+        publish_to_renderers(
+            &app,
+            &mut art_cache,
+            &current,
+            &initial_targets,
+            "subscription",
+            &tx,
+        )
+        .await;
     }
 
     loop {
@@ -122,6 +232,10 @@ async fn run(app: Arc<DaemonContext>) -> Result<()> {
             }
             msg = rx.recv() => {
                 let Some(msg) = msg else { break; };
+                let art_ready_for_current = matches!(
+                    &msg,
+                    PlayerMsg::ArtReady { uri, success: true } if current.art_url == *uri
+                );
                 match msg {
                     PlayerMsg::Snapshot { name, snapshot } => {
                         log::trace!("snapshot from {name}: {}", snapshot_debug(&snapshot));
@@ -134,15 +248,18 @@ async fn run(app: Arc<DaemonContext>) -> Result<()> {
                             stop_player_task(task).await;
                         }
                     }
+                    PlayerMsg::ArtReady { uri, success } => art_cache.finished(&uri, success),
                 }
                 let next = choose_snapshot(&players);
-                if next != current {
+                if next != current || art_ready_for_current {
                     current = next;
                     publish_current_snapshot(
                         &app,
                         &mut subscriptions,
                         &mut known_subscribers,
                         &current,
+                        &mut art_cache,
+                        &tx,
                     ).await;
                 }
             }
@@ -177,6 +294,8 @@ async fn run(app: Arc<DaemonContext>) -> Result<()> {
                                     &mut subscriptions,
                                     &mut known_subscribers,
                                     &current,
+                                    &mut art_cache,
+                                    &tx,
                                 ).await;
                             }
                         }
@@ -195,7 +314,7 @@ async fn run(app: Arc<DaemonContext>) -> Result<()> {
                 let targets = updated_subscribers(&known_subscribers, &next_subscribers);
                 known_subscribers = next_subscribers;
                 if !targets.is_empty() {
-                    publish_to_renderers(&app, &current, &targets, "subscription").await;
+                    publish_to_renderers(&app, &mut art_cache, &current, &targets, "subscription", &tx).await;
                 }
             }
         }
@@ -405,6 +524,8 @@ async fn publish_current_snapshot(
     subscriptions: &mut watch::Receiver<RendererSubscriptionSnapshot>,
     known_subscribers: &mut MprisSubscribers,
     snapshot: &MprisSnapshot,
+    art_cache: &mut ArtCache,
+    tx: &mpsc::Sender<PlayerMsg>,
 ) {
     let subscribers = {
         let snapshot = subscriptions.borrow_and_update();
@@ -412,19 +533,22 @@ async fn publish_current_snapshot(
     };
     let targets: Vec<_> = subscribers.keys().cloned().collect();
     *known_subscribers = subscribers;
-    publish_to_renderers(app, snapshot, &targets, "state change").await;
+    publish_to_renderers(app, art_cache, snapshot, &targets, "state change", tx).await;
 }
 
 async fn publish_to_renderers(
     app: &DaemonContext,
-    snapshot: &MprisSnapshot,
+    art_cache: &mut ArtCache,
+    raw_snapshot: &MprisSnapshot,
     ids: &[RendererId],
     reason: &str,
+    tx: &mpsc::Sender<PlayerMsg>,
 ) {
+    let snapshot = art_cache.prepare_snapshot(raw_snapshot, tx).await;
     log::debug!(
         "publishing {reason} snapshot to {} renderer(s): {}",
         ids.len(),
-        snapshot_debug(snapshot)
+        snapshot_debug(&snapshot)
     );
     for id in ids {
         if let Err(e) = app.renderer_manager.send_mpris(id, snapshot.clone()).await {
@@ -619,6 +743,215 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+fn is_cacheable_art_uri(raw: &str) -> bool {
+    is_data_image_uri(raw)
+        || reqwest::Url::parse(raw)
+            .map(|url| url.scheme() == "https")
+            .unwrap_or(false)
+}
+
+fn is_data_image_uri(raw: &str) -> bool {
+    raw.get(..11)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:image/"))
+}
+
+fn is_data_uri(raw: &str) -> bool {
+    raw.get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+}
+
+fn art_key(uri: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(uri.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn touch(path: &Path) {
+    let _ = std::fs::File::open(path)
+        .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now())));
+}
+
+fn build_art_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .user_agent("waywallen-mpris-art/1")
+        .build()
+        .context("build MPRIS artwork client")
+}
+
+async fn materialize_art(
+    uri: &str,
+    client: Option<&reqwest::Client>,
+    dir: &Path,
+    path: &Path,
+) -> Result<()> {
+    let bytes = if is_data_uri(uri) {
+        decode_data_image(uri)?
+    } else {
+        download_art(
+            client.ok_or_else(|| anyhow!("artwork HTTP client is unavailable"))?,
+            uri,
+        )
+        .await?
+    };
+    write_art_file(dir, path, &bytes).await?;
+    cleanup_art_cache(dir).await
+}
+
+async fn download_art(client: &reqwest::Client, uri: &str) -> Result<Vec<u8>> {
+    let response = client
+        .get(uri)
+        .send()
+        .await
+        .context("request artwork")?
+        .error_for_status()
+        .context("artwork response")?;
+    if let Some(length) = response.content_length() {
+        if length > MAX_ART_BYTES {
+            return Err(anyhow!("artwork exceeds {MAX_ART_BYTES} byte limit"));
+        }
+    }
+    if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+        let content_type = content_type.to_str().unwrap_or_default();
+        if !content_type.to_ascii_lowercase().starts_with("image/") {
+            return Err(anyhow!("artwork content type is not an image"));
+        }
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read artwork response")?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_ART_BYTES as usize {
+            return Err(anyhow!("artwork exceeds {MAX_ART_BYTES} byte limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err(anyhow!("artwork response is empty"));
+    }
+    Ok(bytes)
+}
+
+fn decode_data_image(uri: &str) -> Result<Vec<u8>> {
+    if uri.len() > MAX_DATA_URI_BYTES {
+        return Err(anyhow!("data URI is too large"));
+    }
+    let (meta, payload) = uri
+        .get(5..)
+        .filter(|_| is_data_uri(uri))
+        .and_then(|value| value.split_once(','))
+        .ok_or_else(|| anyhow!("invalid data URI"))?;
+    let mime = meta
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !mime.starts_with("image/") || mime == "image/svg+xml" {
+        return Err(anyhow!("unsupported data URI media type"));
+    }
+    let bytes = if meta
+        .split(';')
+        .any(|parameter| parameter.eq_ignore_ascii_case("base64"))
+    {
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .context("decode base64 artwork")?
+    } else {
+        percent_decode_bytes(payload).ok_or_else(|| anyhow!("invalid percent-encoded artwork"))?
+    };
+    if bytes.is_empty() || bytes.len() > MAX_ART_BYTES as usize {
+        return Err(anyhow!("decoded data artwork exceeds size limit"));
+    }
+    Ok(bytes)
+}
+
+fn percent_decode_bytes(raw: &str) -> Option<Vec<u8>> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            out.push((hex_val(bytes[i + 1])? << 4) | hex_val(bytes[i + 2])?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+async fn write_art_file(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    let part = dir.join(format!(".part-{}", uuid::Uuid::new_v4()));
+    let result: Result<()> = async {
+        let mut file = tokio::fs::File::create(&part).await?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&part, path).await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    result
+}
+
+async fn cleanup_art_cache(dir: &Path) -> Result<()> {
+    cleanup_art_cache_with_limit(dir, MAX_ART_CACHE_BYTES).await
+}
+
+async fn cleanup_art_cache_with_limit(dir: &Path, max_bytes: u64) -> Result<()> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".part-") {
+            let _ = tokio::fs::remove_file(path).await;
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        if !metadata.is_file() {
+            continue;
+        }
+        total = total.saturating_add(metadata.len());
+        files.push((
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            metadata.len(),
+            path,
+        ));
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in files {
+        if total <= max_bytes {
+            break;
+        }
+        if tokio::fs::remove_file(path).await.is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,141 +1049,60 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_data_uris_small() {
-        let small_data = "data:image/png;base64,iVBORw0KGgo=";
-        assert_eq!(sanitize_art_url(small_data), "");
-    }
-
-    #[test]
-    fn sanitize_rejects_data_uris_large() {
-        let large_payload = "A".repeat(100_000);
-        let large_data = format!("data:image/jpeg;base64,{large_payload}");
-        assert_eq!(sanitize_art_url(&large_data), "");
-    }
-
-    #[test]
-    fn sanitize_preserves_file_urls() {
+    fn decodes_base64_and_percent_encoded_data_images() {
         assert_eq!(
-            sanitize_art_url("file:///home/user/cover.jpg"),
-            "/home/user/cover.jpg"
+            decode_data_image("data:image/png;base64,aGVsbG8=").unwrap(),
+            b"hello"
         );
         assert_eq!(
-            sanitize_art_url("file://localhost/tmp/art.png"),
-            "/tmp/art.png"
+            decode_data_image("data:image/png,hello%20world").unwrap(),
+            b"hello world"
         );
+        assert!(decode_data_image("data:text/plain;base64,aGVsbG8=").is_err());
+        assert!(decode_data_image("data:image/svg+xml,%3Csvg%2F%3E").is_err());
+        assert!(is_cacheable_art_uri("HTTPS://example.invalid/cover.png"));
+        assert!(!is_cacheable_art_uri("http://example.invalid/cover.png"));
+        assert!(!is_cacheable_art_uri("ftp://example.invalid/cover.png"));
     }
 
-    #[test]
-    fn sanitize_preserves_https_urls() {
-        let spotify_url = "https://i.scdn.co/image/ab67616d0000b273xyz";
-        assert_eq!(sanitize_art_url(spotify_url), spotify_url);
+    #[tokio::test]
+    async fn cache_hit_rewrites_https_art_without_starting_a_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = "https://example.invalid/cover.png";
+        let path = tmp.path().join(format!("{}.img", art_key(uri)));
+        tokio::fs::write(&path, b"cached").await.unwrap();
+        let mut cache = ArtCache::new(tmp.path().to_path_buf()).await;
+        let (tx, _rx) = mpsc::channel(1);
+
+        let resolved = cache.resolve(uri, true, &tx).await;
+        assert_eq!(resolved, path.to_string_lossy());
+        assert!(cache.in_flight.is_empty());
     }
 
-    #[test]
-    fn sanitize_rejects_oversized_non_data_urls() {
-        let huge_url = format!("https://example.com/{}", "x".repeat(MAX_ART_URL_BYTES + 1));
-        assert_eq!(sanitize_art_url(&huge_url), "");
-    }
+    #[tokio::test]
+    async fn cache_cleanup_removes_partial_and_oldest_entries_over_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join(".part-interrupted"), b"partial")
+            .await
+            .unwrap();
+        let old = tmp.path().join("old.img");
+        let new = tmp.path().join("new.img");
+        tokio::fs::write(&old, b"123456").await.unwrap();
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    SystemTime::now()
+                        .checked_sub(Duration::from_secs(60))
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        tokio::fs::write(&new, b"123456").await.unwrap();
 
-    #[test]
-    fn sanitize_accepts_url_at_limit() {
-        // Create a URL exactly at the limit (minus the prefix)
-        let path = "x".repeat(MAX_ART_URL_BYTES - 20);
-        let url = format!("https://ex.co/{path}");
-        assert!(url.len() <= MAX_ART_URL_BYTES);
-        assert_eq!(sanitize_art_url(&url), url);
-    }
-
-    #[test]
-    fn sanitize_handles_empty_string() {
-        assert_eq!(sanitize_art_url(""), "");
-    }
-
-    #[test]
-    fn ensure_art_fits_allows_small_combined() {
-        let mut snapshot = MprisSnapshot {
-            art_url: "https://example.com/art.jpg".to_string(),
-            previous_art_url: "/tmp/previous.jpg".to_string(),
-            ..MprisSnapshot::default()
-        };
-        ensure_mpris_art_fits(&mut snapshot);
-        assert!(!snapshot.art_url.is_empty());
-        assert!(!snapshot.previous_art_url.is_empty());
-    }
-
-    #[test]
-    fn ensure_art_fits_drops_previous_when_combined_too_large() {
-        let large_url =
-            "https://example.com/".to_string() + &"x".repeat(MAX_COMBINED_ART_BYTES / 2 + 100);
-        let mut snapshot = MprisSnapshot {
-            art_url: large_url.clone(),
-            previous_art_url: large_url.clone(),
-            ..MprisSnapshot::default()
-        };
-        ensure_mpris_art_fits(&mut snapshot);
-        assert_eq!(snapshot.art_url, large_url);
-        assert!(snapshot.previous_art_url.is_empty());
-    }
-
-    #[test]
-    fn ensure_art_fits_clears_art_when_alone_too_large() {
-        let alone = "x".repeat(MAX_COMBINED_ART_BYTES + 1);
-        let mut snapshot = MprisSnapshot {
-            art_url: alone,
-            previous_art_url: String::new(),
-            ..MprisSnapshot::default()
-        };
-        ensure_mpris_art_fits(&mut snapshot);
-        assert!(snapshot.art_url.is_empty());
-        assert!(snapshot.previous_art_url.is_empty());
-    }
-
-    #[test]
-    fn ensure_art_fits_at_exactly_limit() {
-        // Create URLs that sum to exactly MAX_COMBINED_ART_BYTES
-        let url1 = "x".repeat(MAX_COMBINED_ART_BYTES / 2);
-        let url2 = "y".repeat(MAX_COMBINED_ART_BYTES / 2);
-        let mut snapshot = MprisSnapshot {
-            art_url: url1.clone(),
-            previous_art_url: url2.clone(),
-            ..MprisSnapshot::default()
-        };
-        ensure_mpris_art_fits(&mut snapshot);
-        // At exactly the limit, should be accepted
-        assert_eq!(snapshot.art_url, url1);
-        assert_eq!(snapshot.previous_art_url, url2);
-    }
-
-    #[test]
-    fn sanitize_integration_elisa_like_data_uri() {
-        // Simulate Elisa sending a base64-encoded album cover
-        let base64_image = "A".repeat(50_000);
-        let elisa_art = format!("data:image/jpeg;base64,{base64_image}");
-        
-        let sanitized = sanitize_art_url(&elisa_art);
-        assert_eq!(sanitized, "");
-    }
-
-    #[test]
-    fn sanitize_integration_lollypop_file_url() {
-        // Simulate Lollypop/VLC sending a file path
-        let lollypop_art = "file:///home/user/.cache/lollypop/album_art.jpg";
-        let sanitized = sanitize_art_url(lollypop_art);
-        assert_eq!(sanitized, "/home/user/.cache/lollypop/album_art.jpg");
-    }
-
-    #[test]
-    fn sanitize_integration_prevents_previous_data_retention() {
-        // Simulate track change where previous was data: URI
-        let data_uri = "data:image/png;base64,".to_string() + &"x".repeat(1000);
-        let file_uri = "file:///tmp/new.jpg";
-        
-        // First sanitize should reject data:
-        let sanitized1 = sanitize_art_url(&data_uri);
-        assert_eq!(sanitized1, "");
-        
-        // Second sanitize should accept file:
-        let sanitized2 = sanitize_art_url(file_uri);
-        assert_eq!(sanitized2, "/tmp/new.jpg");
+        cleanup_art_cache_with_limit(tmp.path(), 10).await.unwrap();
+        assert!(!old.exists());
+        assert!(new.exists());
+        assert!(!tmp.path().join(".part-interrupted").exists());
     }
 }
