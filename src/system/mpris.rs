@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::zvariant::OwnedValue;
 
@@ -30,6 +31,9 @@ const LOG_TEXT_MAX_CHARS: usize = 80;
 const MAX_ART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ART_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DATA_URI_BYTES: usize = 12 * 1024 * 1024;
+const MAX_ART_DOWNLOADS: usize = 2;
+const MAX_ART_FAILURES: usize = 128;
+const ART_FAILURE_TTL: Duration = Duration::from_secs(30);
 
 /// Maximum allowed size for a single art_url field. Paths, file:// URLs,
 /// and typical https:// URLs fit comfortably. Large data: URIs are rejected.
@@ -46,7 +50,8 @@ enum PlayerMsg {
     },
     Gone(String),
     ArtReady {
-        uri: String,
+        key: String,
+        request_id: u64,
         success: bool,
     },
 }
@@ -55,13 +60,19 @@ struct PlayerTask {
     handle: JoinHandle<()>,
 }
 
+struct ArtDownload {
+    request_id: u64,
+    handle: JoinHandle<()>,
+}
+
 /// Resolves MPRIS artwork into local files. The coordinator retains the raw
 /// URI in player snapshots; only outgoing renderer snapshots are rewritten.
 struct ArtCache {
     dir: PathBuf,
     client: Option<reqwest::Client>,
-    in_flight: HashSet<String>,
-    failed: HashSet<String>,
+    in_flight: HashMap<String, ArtDownload>,
+    failed: HashMap<String, Instant>,
+    next_request_id: u64,
 }
 
 impl ArtCache {
@@ -76,8 +87,9 @@ impl ArtCache {
             client: build_art_client()
                 .inspect_err(|error| log::warn!("mpris artwork client unavailable: {error:#}"))
                 .ok(),
-            in_flight: HashSet::new(),
-            failed: HashSet::new(),
+            in_flight: HashMap::new(),
+            failed: HashMap::new(),
+            next_request_id: 0,
         }
     }
 
@@ -99,48 +111,108 @@ impl ArtCache {
         if !is_cacheable_art_uri(raw) {
             return String::new();
         }
-        let path = self.path_for(raw);
+        let key = art_key(raw);
+        let path = self.path_for_key(&key);
         if is_regular_file(&path) {
+            self.failed.remove(&key);
             touch(&path);
             return path.to_string_lossy().into_owned();
         }
-        if !fetch || self.failed.contains(raw) || !self.in_flight.insert(raw.to_string()) {
+        if !fetch || self.in_flight.contains_key(&key) || !self.retry_ready(&key) {
             return String::new();
         }
+        if self.in_flight.len() >= MAX_ART_DOWNLOADS {
+            self.cancel_oldest().await;
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
         let client = self.client.clone();
-        let uri = raw.to_string();
-        let task_uri = uri.clone();
+        let task_uri = raw.to_string();
+        let task_key = key.clone();
         let dir = self.dir.clone();
         let task_path = path;
         let task_tx = tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let success = match materialize_art(&task_uri, client.as_ref(), &dir, &task_path).await
             {
                 Ok(()) => true,
                 Err(error) => {
-                    log::warn!("mpris artwork {} failed: {error:#}", art_key(&task_uri));
+                    log::warn!("mpris artwork {task_key} failed: {error:#}");
                     false
                 }
             };
             let _ = task_tx
                 .send(PlayerMsg::ArtReady {
-                    uri: task_uri,
+                    key: task_key,
+                    request_id,
                     success,
                 })
                 .await;
         });
+        self.in_flight
+            .insert(key, ArtDownload { request_id, handle });
         String::new()
     }
 
-    fn finished(&mut self, uri: &str, success: bool) {
-        self.in_flight.remove(uri);
-        if !success {
-            self.failed.insert(uri.to_string());
-        }
+    async fn cancel_oldest(&mut self) {
+        let Some(key) = self
+            .in_flight
+            .iter()
+            .min_by_key(|(_, download)| download.request_id)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        let download = self.in_flight.remove(&key).unwrap();
+        log::debug!("canceling oldest MPRIS artwork download {key}");
+        download.handle.abort();
+        let _ = download.handle.await;
     }
 
-    fn path_for(&self, uri: &str) -> PathBuf {
-        self.dir.join(format!("{}.img", art_key(uri)))
+    fn finished(&mut self, key: &str, request_id: u64, success: bool) -> bool {
+        if self
+            .in_flight
+            .get(key)
+            .is_none_or(|download| download.request_id != request_id)
+        {
+            return false;
+        }
+        self.in_flight.remove(key);
+        if success {
+            self.failed.remove(key);
+        } else {
+            self.remember_failure(key.to_string());
+        }
+        true
+    }
+
+    fn retry_ready(&mut self, key: &str) -> bool {
+        let Some(retry_at) = self.failed.get(key).copied() else {
+            return true;
+        };
+        if retry_at > Instant::now() {
+            return false;
+        }
+        self.failed.remove(key);
+        true
+    }
+
+    fn remember_failure(&mut self, key: String) {
+        if !self.failed.contains_key(&key) && self.failed.len() >= MAX_ART_FAILURES {
+            if let Some(oldest) = self
+                .failed
+                .iter()
+                .min_by_key(|(_, retry_at)| **retry_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.failed.remove(&oldest);
+            }
+        }
+        self.failed.insert(key, Instant::now() + ART_FAILURE_TTL);
+    }
+
+    fn path_for_key(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("{key}.img"))
     }
 }
 
@@ -232,10 +304,7 @@ async fn run(app: Arc<DaemonContext>) -> Result<()> {
             }
             msg = rx.recv() => {
                 let Some(msg) = msg else { break; };
-                let art_ready_for_current = matches!(
-                    &msg,
-                    PlayerMsg::ArtReady { uri, success: true } if current.art_url == *uri
-                );
+                let mut refresh_art = false;
                 match msg {
                     PlayerMsg::Snapshot { name, snapshot } => {
                         log::trace!("snapshot from {name}: {}", snapshot_debug(&snapshot));
@@ -248,10 +317,19 @@ async fn run(app: Arc<DaemonContext>) -> Result<()> {
                             stop_player_task(task).await;
                         }
                     }
-                    PlayerMsg::ArtReady { uri, success } => art_cache.finished(&uri, success),
+                    PlayerMsg::ArtReady {
+                        key,
+                        request_id,
+                        success,
+                    } => {
+                        let accepted = art_cache.finished(&key, request_id, success);
+                        let completed_current = is_cacheable_art_uri(&current.art_url)
+                            && art_key(&current.art_url) == key;
+                        refresh_art = accepted && (success || !completed_current);
+                    }
                 }
                 let next = choose_snapshot(&players);
-                if next != current || art_ready_for_current {
+                if next != current || (refresh_art && !known_subscribers.is_empty()) {
                     current = next;
                     publish_current_snapshot(
                         &app,
@@ -544,6 +622,9 @@ async fn publish_to_renderers(
     reason: &str,
     tx: &mpsc::Sender<PlayerMsg>,
 ) {
+    if ids.is_empty() {
+        return;
+    }
     let snapshot = art_cache.prepare_snapshot(raw_snapshot, tx).await;
     log::debug!(
         "publishing {reason} snapshot to {} renderer(s): {}",
@@ -892,22 +973,39 @@ fn percent_decode_bytes(raw: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+struct PartialArtFile {
+    path: Option<PathBuf>,
+}
+
+impl PartialArtFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn commit(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for PartialArtFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 async fn write_art_file(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
     tokio::fs::create_dir_all(dir).await?;
     let part = dir.join(format!(".part-{}", uuid::Uuid::new_v4()));
-    let result: Result<()> = async {
-        let mut file = tokio::fs::File::create(&part).await?;
-        file.write_all(bytes).await?;
-        file.flush().await?;
-        drop(file);
-        tokio::fs::rename(&part, path).await?;
-        Ok(())
-    }
-    .await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&part).await;
-    }
-    result
+    let mut partial = PartialArtFile::new(part.clone());
+    let mut file = tokio::fs::File::create(&part).await?;
+    file.write_all(bytes).await?;
+    file.flush().await?;
+    drop(file);
+    tokio::fs::rename(&part, path).await?;
+    partial.commit();
+    Ok(())
 }
 
 async fn cleanup_art_cache(dir: &Path) -> Result<()> {
@@ -955,6 +1053,16 @@ async fn cleanup_art_cache_with_limit(dir: &Path, max_bytes: u64) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_art_cache(dir: PathBuf) -> ArtCache {
+        ArtCache {
+            dir,
+            client: None,
+            in_flight: HashMap::new(),
+            failed: HashMap::new(),
+            next_request_id: 0,
+        }
+    }
 
     #[test]
     fn normalizes_local_file_art_url() {
@@ -1077,6 +1185,82 @@ mod tests {
         let resolved = cache.resolve(uri, true, &tx).await;
         assert_eq!(resolved, path.to_string_lossy());
         assert!(cache.in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_cancels_oldest_download_before_starting_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = test_art_cache(tmp.path().to_path_buf());
+        let (tx, _rx) = mpsc::channel(8);
+        let first = "https://example.invalid/first.png";
+        let second = "https://example.invalid/second.png";
+        let third = "https://example.invalid/third.png";
+
+        cache
+            .prepare_snapshot(
+                &MprisSnapshot {
+                    art_url: first.to_string(),
+                    ..MprisSnapshot::default()
+                },
+                &tx,
+            )
+            .await;
+        cache
+            .prepare_snapshot(
+                &MprisSnapshot {
+                    art_url: second.to_string(),
+                    previous_art_url: first.to_string(),
+                    ..MprisSnapshot::default()
+                },
+                &tx,
+            )
+            .await;
+        assert_eq!(cache.in_flight.len(), MAX_ART_DOWNLOADS);
+        let first_request_id = cache.in_flight[&art_key(first)].request_id;
+
+        cache
+            .prepare_snapshot(
+                &MprisSnapshot {
+                    art_url: third.to_string(),
+                    previous_art_url: second.to_string(),
+                    ..MprisSnapshot::default()
+                },
+                &tx,
+            )
+            .await;
+        assert_eq!(cache.in_flight.len(), MAX_ART_DOWNLOADS);
+        assert!(!cache.in_flight.contains_key(&art_key(first)));
+        assert!(cache.in_flight.contains_key(&art_key(second)));
+        assert!(cache.in_flight.contains_key(&art_key(third)));
+
+        cache.resolve(first, true, &tx).await;
+        let restarted_request_id = cache.in_flight[&art_key(first)].request_id;
+        assert_ne!(restarted_request_id, first_request_id);
+        assert!(!cache.finished(&art_key(first), first_request_id, false));
+        assert!(cache.in_flight.contains_key(&art_key(first)));
+        assert!(!cache.failed.contains_key(&art_key(first)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cache_expires_bounded_failure_entries_on_demand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = test_art_cache(tmp.path().to_path_buf());
+        let (tx, _rx) = mpsc::channel(1);
+        let uri = "https://example.invalid/cover.png";
+        let key = art_key(uri);
+        cache.remember_failure(key.clone());
+
+        assert!(cache.resolve(uri, true, &tx).await.is_empty());
+        assert!(cache.in_flight.is_empty());
+
+        tokio::time::advance(ART_FAILURE_TTL).await;
+        assert!(cache.resolve(uri, true, &tx).await.is_empty());
+        assert!(cache.in_flight.contains_key(&key));
+
+        for index in 0..(MAX_ART_FAILURES + 16) {
+            cache.remember_failure(format!("failure-{index}"));
+        }
+        assert_eq!(cache.failed.len(), MAX_ART_FAILURES);
     }
 
     #[tokio::test]
