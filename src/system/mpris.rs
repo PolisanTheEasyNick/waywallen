@@ -34,14 +34,7 @@ const MAX_DATA_URI_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ART_DOWNLOADS: usize = 2;
 const MAX_ART_FAILURES: usize = 128;
 const ART_FAILURE_TTL: Duration = Duration::from_secs(30);
-
-/// Maximum allowed size for a single art_url field. Paths, file:// URLs,
-/// and typical https:// URLs fit comfortably. Large data: URIs are rejected.
-const MAX_ART_URL_BYTES: usize = 4096;
-
-/// Maximum combined size for art_url + previous_art_url to ensure the
-/// MPRIS snapshot stays well under the IPC frame limit (~65KB).
-const MAX_COMBINED_ART_BYTES: usize = 8192;
+const MAX_ART_URI_BYTES: usize = 4096;
 
 enum PlayerMsg {
     Snapshot {
@@ -104,7 +97,12 @@ impl ArtCache {
         snapshot
     }
 
-    async fn resolve(&mut self, raw: &str, fetch: bool, tx: &mpsc::Sender<PlayerMsg>) -> String {
+    async fn resolve(
+        &mut self,
+        raw: &str,
+        fetch_remote: bool,
+        tx: &mpsc::Sender<PlayerMsg>,
+    ) -> String {
         if raw.is_empty() || raw.starts_with('/') {
             return raw.to_string();
         }
@@ -118,7 +116,10 @@ impl ArtCache {
             touch(&path);
             return path.to_string_lossy().into_owned();
         }
-        if !fetch || self.in_flight.contains_key(&key) || !self.retry_ready(&key) {
+        if is_data_image_uri(raw) {
+            return self.materialize_data(raw, key, path).await;
+        }
+        if !fetch_remote || self.in_flight.contains_key(&key) || !self.retry_ready(&key) {
             return String::new();
         }
         if self.in_flight.len() >= MAX_ART_DOWNLOADS {
@@ -152,6 +153,23 @@ impl ArtCache {
         self.in_flight
             .insert(key, ArtDownload { request_id, handle });
         String::new()
+    }
+
+    async fn materialize_data(&mut self, uri: &str, key: String, path: PathBuf) -> String {
+        if !self.retry_ready(&key) {
+            return String::new();
+        }
+        match materialize_art(uri, None, &self.dir, &path).await {
+            Ok(()) => {
+                self.failed.remove(&key);
+                path.to_string_lossy().into_owned()
+            }
+            Err(error) => {
+                log::warn!("mpris artwork {key} failed: {error:#}");
+                self.remember_failure(key);
+                String::new()
+            }
+        }
     }
 
     async fn cancel_oldest(&mut self) {
@@ -537,17 +555,16 @@ async fn read_player_snapshot(
         .get_property::<HashMap<String, OwnedValue>>("Metadata")
         .await
         .unwrap_or_default();
-    
-    // Sanitize art URL to prevent oversized IPC frames
-    let art_url = sanitize_art_url(&metadata_string(&metadata, "mpris:artUrl"));
+
+    let art_url = normalize_metadata_art_url(&metadata_string(&metadata, "mpris:artUrl"));
     if art_url != *last_art_url {
         if !last_art_url.is_empty() {
             *previous_art_url = last_art_url.clone();
         }
         *last_art_url = art_url.clone();
     }
-    
-    let mut snapshot = MprisSnapshot {
+
+    Some(MprisSnapshot {
         state: playback_state_from_status(&status),
         title: metadata_string(&metadata, "xesam:title"),
         artist: metadata_string_list(&metadata, "xesam:artist"),
@@ -555,12 +572,7 @@ async fn read_player_snapshot(
         album_artist: metadata_string_list(&metadata, "xesam:albumArtist"),
         art_url,
         previous_art_url: previous_art_url.clone(),
-    };
-    
-    // Final safety check: ensure combined art size doesn't exceed limit
-    ensure_mpris_art_fits(&mut snapshot);
-    
-    Some(snapshot)
+    })
 }
 
 fn choose_snapshot(players: &BTreeMap<String, MprisSnapshot>) -> MprisSnapshot {
@@ -734,64 +746,20 @@ fn normalize_art_url(raw: &str) -> String {
     percent_decode(&path).unwrap_or(path)
 }
 
-/// Sanitize art URLs to prevent oversized IPC frames from crashing the renderer.
-/// Rejects data: URIs (which the renderer can't load anyway) and oversized URLs.
-/// For valid URLs, applies normalize_art_url to handle file:// paths.
-fn sanitize_art_url(raw: &str) -> String {
-    if raw.is_empty() {
-        return String::new();
+fn normalize_metadata_art_url(raw: &str) -> String {
+    if is_data_image_uri(raw) {
+        if raw.len() <= MAX_DATA_URI_BYTES {
+            return raw.to_string();
+        }
+    } else if !is_data_uri(raw) && raw.len() <= MAX_ART_URI_BYTES {
+        return normalize_art_url(raw);
     }
 
-    // data: URIs are not supported by the renderer's texture loader and
-    // are often very large (base64-encoded images). Always reject them.
-    if raw.starts_with("data:") {
-        log::debug!(
-            "rejecting data: art URL ({} bytes): {}",
-            raw.len(),
-            art_url_summary(raw)
-        );
-        return String::new();
-    }
-
-    // Reject any URL exceeding the single-field size limit.
-    if raw.len() > MAX_ART_URL_BYTES {
-        log::debug!(
-            "rejecting oversized art URL ({} bytes, max {}): {}",
-            raw.len(),
-            MAX_ART_URL_BYTES,
-            art_url_summary(raw)
-        );
-        return String::new();
-    }
-
-    // Valid URL: normalize file:// paths, pass through others (https://, etc.)
-    normalize_art_url(raw)
-}
-
-/// Ensure the combined size of art URLs doesn't exceed the limit.
-/// Prefers keeping the current `art_url` and drops `previous_art_url` first.
-/// Only clears `art_url` if it alone still exceeds the combined budget.
-fn ensure_mpris_art_fits(snapshot: &mut MprisSnapshot) {
-    let combined = snapshot.art_url.len() + snapshot.previous_art_url.len();
-    if combined <= MAX_COMBINED_ART_BYTES {
-        return;
-    }
-
-    log::warn!(
-        "combined art URLs too large ({} bytes, max {}): dropping previous_art_url",
-        combined,
-        MAX_COMBINED_ART_BYTES
+    log::debug!(
+        "rejecting unsupported or oversized MPRIS artwork URI: {}",
+        art_url_summary(raw)
     );
-    snapshot.previous_art_url.clear();
-
-    if snapshot.art_url.len() > MAX_COMBINED_ART_BYTES {
-        log::warn!(
-            "art_url alone still too large ({} bytes, max {}): clearing art_url",
-            snapshot.art_url.len(),
-            MAX_COMBINED_ART_BYTES
-        );
-        snapshot.art_url.clear();
-    }
+    String::new()
 }
 
 fn percent_decode(raw: &str) -> Option<String> {
@@ -875,7 +843,10 @@ async fn materialize_art(
     path: &Path,
 ) -> Result<()> {
     let bytes = if is_data_uri(uri) {
-        decode_data_image(uri)?
+        let uri = uri.to_string();
+        tokio::task::spawn_blocking(move || decode_data_image(&uri))
+            .await
+            .context("join artwork decode task")??
     } else {
         download_art(
             client.ok_or_else(|| anyhow!("artwork HTTP client is unavailable"))?,
@@ -884,7 +855,10 @@ async fn materialize_art(
         .await?
     };
     write_art_file(dir, path, &bytes).await?;
-    cleanup_art_cache(dir).await
+    if let Err(error) = cleanup_art_cache(dir).await {
+        log::warn!("mpris art cache cleanup failed: {error:#}");
+    }
+    Ok(())
 }
 
 async fn download_art(client: &reqwest::Client, uri: &str) -> Result<Vec<u8>> {
@@ -1081,6 +1055,20 @@ mod tests {
     }
 
     #[test]
+    fn preserves_bounded_data_images_for_cache_materialization() {
+        let data_image = "data:image/png;base64,aGVsbG8=";
+        assert_eq!(normalize_metadata_art_url(data_image), data_image);
+        assert_eq!(
+            normalize_metadata_art_url("file:///tmp/Cover%20Art.png"),
+            "/tmp/Cover Art.png"
+        );
+        assert!(normalize_metadata_art_url("data:text/plain;base64,aGVsbG8=").is_empty());
+
+        let oversized = format!("data:image/png;base64,{}", "A".repeat(MAX_DATA_URI_BYTES));
+        assert!(normalize_metadata_art_url(&oversized).is_empty());
+    }
+
+    #[test]
     fn maps_playback_status() {
         assert_eq!(playback_state_from_status("Stopped"), STATE_STOPPED);
         assert_eq!(playback_state_from_status("Playing"), STATE_PLAYING);
@@ -1171,6 +1159,57 @@ mod tests {
         assert!(is_cacheable_art_uri("HTTPS://example.invalid/cover.png"));
         assert!(!is_cacheable_art_uri("http://example.invalid/cover.png"));
         assert!(!is_cacheable_art_uri("ftp://example.invalid/cover.png"));
+    }
+
+    #[tokio::test]
+    async fn cache_materializes_data_images_before_preparing_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = test_art_cache(tmp.path().to_path_buf());
+        let (tx, mut rx) = mpsc::channel(1);
+        let current = "data:image/png;base64,aGVsbG8=";
+        let previous = "data:image/png;base64,d29ybGQ=";
+
+        let prepared = cache
+            .prepare_snapshot(
+                &MprisSnapshot {
+                    art_url: current.to_string(),
+                    previous_art_url: previous.to_string(),
+                    ..MprisSnapshot::default()
+                },
+                &tx,
+            )
+            .await;
+        assert_eq!(tokio::fs::read(&prepared.art_url).await.unwrap(), b"hello");
+        assert_eq!(
+            tokio::fs::read(&prepared.previous_art_url).await.unwrap(),
+            b"world"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(cache.in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_keeps_http_materialization_in_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = test_art_cache(tmp.path().to_path_buf());
+        let (tx, mut rx) = mpsc::channel(1);
+        let uri = "https://example.invalid/cover.png";
+        let key = art_key(uri);
+
+        assert!(cache.resolve(uri, true, &tx).await.is_empty());
+        let request_id = cache.in_flight[&key].request_id;
+        let PlayerMsg::ArtReady {
+            key: completed_key,
+            request_id: completed_request_id,
+            success,
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("unexpected MPRIS message");
+        };
+        assert_eq!(completed_key, key);
+        assert_eq!(completed_request_id, request_id);
+        assert!(!success);
+        assert!(cache.finished(&key, request_id, success));
     }
 
     #[tokio::test]
