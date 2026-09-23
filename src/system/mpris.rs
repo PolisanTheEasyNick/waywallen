@@ -31,6 +31,14 @@ const MAX_ART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ART_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DATA_URI_BYTES: usize = 12 * 1024 * 1024;
 
+/// Maximum allowed size for a single art_url field. Paths, file:// URLs,
+/// and typical https:// URLs fit comfortably. Large data: URIs are rejected.
+const MAX_ART_URL_BYTES: usize = 4096;
+
+/// Maximum combined size for art_url + previous_art_url to ensure the
+/// MPRIS snapshot stays well under the IPC frame limit (~65KB).
+const MAX_COMBINED_ART_BYTES: usize = 8192;
+
 enum PlayerMsg {
     Snapshot {
         name: String,
@@ -451,14 +459,17 @@ async fn read_player_snapshot(
         .get_property::<HashMap<String, OwnedValue>>("Metadata")
         .await
         .unwrap_or_default();
-    let art_url = normalize_art_url(&metadata_string(&metadata, "mpris:artUrl"));
+    
+    // Sanitize art URL to prevent oversized IPC frames
+    let art_url = sanitize_art_url(&metadata_string(&metadata, "mpris:artUrl"));
     if art_url != *last_art_url {
         if !last_art_url.is_empty() {
             *previous_art_url = last_art_url.clone();
         }
         *last_art_url = art_url.clone();
     }
-    Some(MprisSnapshot {
+    
+    let mut snapshot = MprisSnapshot {
         state: playback_state_from_status(&status),
         title: metadata_string(&metadata, "xesam:title"),
         artist: metadata_string_list(&metadata, "xesam:artist"),
@@ -466,7 +477,12 @@ async fn read_player_snapshot(
         album_artist: metadata_string_list(&metadata, "xesam:albumArtist"),
         art_url,
         previous_art_url: previous_art_url.clone(),
-    })
+    };
+    
+    // Final safety check: ensure combined art size doesn't exceed limit
+    ensure_mpris_art_fits(&mut snapshot);
+    
+    Some(snapshot)
 }
 
 fn choose_snapshot(players: &BTreeMap<String, MprisSnapshot>) -> MprisSnapshot {
@@ -635,6 +651,66 @@ fn normalize_art_url(raw: &str) -> String {
         return raw.to_string();
     };
     percent_decode(&path).unwrap_or(path)
+}
+
+/// Sanitize art URLs to prevent oversized IPC frames from crashing the renderer.
+/// Rejects data: URIs (which the renderer can't load anyway) and oversized URLs.
+/// For valid URLs, applies normalize_art_url to handle file:// paths.
+fn sanitize_art_url(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    // data: URIs are not supported by the renderer's texture loader and
+    // are often very large (base64-encoded images). Always reject them.
+    if raw.starts_with("data:") {
+        log::debug!(
+            "rejecting data: art URL ({} bytes): {}",
+            raw.len(),
+            art_url_summary(raw)
+        );
+        return String::new();
+    }
+
+    // Reject any URL exceeding the single-field size limit.
+    if raw.len() > MAX_ART_URL_BYTES {
+        log::debug!(
+            "rejecting oversized art URL ({} bytes, max {}): {}",
+            raw.len(),
+            MAX_ART_URL_BYTES,
+            art_url_summary(raw)
+        );
+        return String::new();
+    }
+
+    // Valid URL: normalize file:// paths, pass through others (https://, etc.)
+    normalize_art_url(raw)
+}
+
+/// Ensure the combined size of art URLs doesn't exceed the limit.
+/// Prefers keeping the current `art_url` and drops `previous_art_url` first.
+/// Only clears `art_url` if it alone still exceeds the combined budget.
+fn ensure_mpris_art_fits(snapshot: &mut MprisSnapshot) {
+    let combined = snapshot.art_url.len() + snapshot.previous_art_url.len();
+    if combined <= MAX_COMBINED_ART_BYTES {
+        return;
+    }
+
+    log::warn!(
+        "combined art URLs too large ({} bytes, max {}): dropping previous_art_url",
+        combined,
+        MAX_COMBINED_ART_BYTES
+    );
+    snapshot.previous_art_url.clear();
+
+    if snapshot.art_url.len() > MAX_COMBINED_ART_BYTES {
+        log::warn!(
+            "art_url alone still too large ({} bytes, max {}): clearing art_url",
+            snapshot.art_url.len(),
+            MAX_COMBINED_ART_BYTES
+        );
+        snapshot.art_url.clear();
+    }
 }
 
 fn percent_decode(raw: &str) -> Option<String> {
