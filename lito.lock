@@ -3,7 +3,7 @@ version = 1
 [[packages]]
 name = "luato"
 version = "0.1.0"
-source = "git+https://github.com/litocpp/luato.git#df0c6f2d1cce2051b4711d36067619eda7933683"
+source = "git+https://github.com/litocpp/luato.git#bd4848b3d6dc2cc57928e4405c3593b67322d6f8"
 dependencies = [
   "luato-lua",
   "rstd-parse",
