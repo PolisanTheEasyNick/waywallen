@@ -57,7 +57,7 @@ struct RuleState {
 pub struct State {
     pub last_flags: u32,
     pub stop_applied: bool,
-    rules: [RuleState; 6],
+    rules: [RuleState; 7],
     pub resume_token: u64,
 }
 

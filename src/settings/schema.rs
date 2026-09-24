@@ -168,7 +168,7 @@ impl Default for AutoReplayPolicy {
             fullscreen: AutoAction::Pause,
             session_locked: AutoAction::Stop,
             session_inactive: AutoAction::Stop,
-            gamemode: AutoAction::None,
+            gamemode: AutoAction::Stop,
             resume_delay_ms: DEFAULT_AUTO_REPLAY_RESUME_DELAY_MS,
         }
     }
